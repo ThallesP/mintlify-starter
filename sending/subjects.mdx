@@ -1,0 +1,92 @@
+---
+title: "Using Subjects to Scope Webhook Events by Entity"
+sidebarTitle: "Subjects"
+description: "Learn how subjects tie every webhook event to a domain entity, enabling scoped subscriber lookups, outbox indexing, and signed payload trust."
+---
+
+Every webhook event in the SDK is associated with a *subject* — a string that identifies the domain entity the event is about. A subject might be an account ID (`acct_42`), a user ID (`user_123`), an order ID (`ord_7`), or any other primary key in your domain vocabulary. The subject is not a concept owned by the SDK; you choose what it means, and it flows transparently through every layer of the system.
+
+## Why subjects matter
+
+Subjects solve a practical problem that grows with your application: how do you scope things efficiently when multiple tenants or entities share a single webhook infrastructure?
+
+**Scoped subscriber lookups** — your `SubscriberResolver` receives the subject alongside the event name. You can write a single indexed query — `WHERE subject = $subject AND events @> ARRAY[$event]` — without parsing payloads or joining through multiple tables.
+
+**Outbox row indexing** — in outbox mode the subject is stored as a column on the outbox row. Queries like "show me all deliveries for `acct_42`" are a single `WHERE subject = 'acct_42'` — no full scans, no JSON extraction.
+
+**Signed payload trust** — the subject travels inside the signed JSON body (`{ event, subject, data }`). Consumers receive it as `result.payload.subject` after signature verification, so they can trust the subject was set by you, not injected by an intermediary.
+
+## Subject in the subscriber resolver
+
+Your resolver always receives the current subject, even before you look up subscribers:
+
+```typescript
+const wh = webhooks({
+  events,
+  subscribers: async ({ event, subject }) => {
+    // subject is typed string | null here (null only when subject: "optional" is set)
+    return db
+      .select({ url: subs.url, secret: subs.secret })
+      .from(subs)
+      .where(
+        and(
+          eq(subs.accountId, subject!),
+          arrayContains(subs.events, [event]),
+        ),
+      );
+  },
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+});
+```
+
+## Subject is required by default
+
+Unless you opt out, a call to `wh.send()` without a `subject` is a compile-time error. The TypeScript overloads are written so the compiler rejects it before the code ever runs:
+
+```typescript
+// ✗ Type error: property 'subject' is missing
+await wh.send({ event: "invoice.paid", data: { invoiceId: "inv_1", amountCents: 4200 } });
+
+// ✓ Correct
+await wh.send({ event: "invoice.paid", subject: "acct_42", data: { ... } });
+```
+
+At runtime, the SDK also validates that `subject` is not an empty string — an empty string is rejected with an error result.
+
+## Making subject optional
+
+If you are building a single-tenant tool or an internal event bus where there is genuinely no meaningful entity to associate events with, you can relax the requirement by setting `subject: "optional"` in the config:
+
+```typescript
+const wh = webhooks({
+  events,
+  subscribers,
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+  subject: "optional",
+});
+
+// Both calls now compile:
+await wh.send({ event: "invoice.paid", data: { invoiceId: "inv_1", amountCents: 4200 } });
+await wh.send({ event: "invoice.paid", subject: "acct_42", data: { ... } });
+```
+
+When `subject` is omitted at runtime, the SDK records `null` in the outbox row and sends `"subject": null` inside the signed body. Your subscriber resolver receives `subject: null` and can handle it however makes sense — for example, by returning all subscribers regardless of account.
+
+<Note>
+  `subject: "optional"` is a global knob on the `webhooks()` instance. It does not let you make subject optional for some events and required for others. If you have a mix, create two separate `webhooks()` instances.
+</Note>
+
+## Subject flows to every layer
+
+Here is a summary of where the subject appears once you call `wh.send()`:
+
+| Layer | How the subject is used |
+|---|---|
+| Subscriber resolver | Received as `subject` in the resolver argument — use it to scope your database query |
+| Outbox row | Stored in the `subject` column — indexed for per-entity queries |
+| Signed body | Sent as `"subject"` in the JSON payload — verified by consumers via `result.payload.subject` |
+| Wire headers | Not in headers — only in the signed body |
+
+<Tip>
+  In outbox mode, the `subject` column gives you per-tenant dead-letter triage for free. When the `onDead` worker hook fires, the `OutboxRow` carries the subject — you can group dead-letter alerts by account, look up an account's owner, and notify them directly without parsing event payloads.
+</Tip>

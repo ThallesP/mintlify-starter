@@ -1,0 +1,206 @@
+---
+title: "PostgreSQL Outbox Adapter: Schema and Claim Query"
+sidebarTitle: "PostgreSQL"
+description: "Create the webhook_outbox table, wire the leasing claim query, and implement all five OutboxAdapter methods against a Postgres database."
+---
+
+A Postgres-backed outbox adapter is the recommended choice for production workloads. Your outbox rows live in the same database as your application data, which means a `wh.with(tx).send(...)` call inside a transaction is genuinely atomic — both the business row and the outbox row either commit or roll back together. This section walks you through the table schema, indexes, the safe claim query, and a TypeScript sketch wiring all five adapter methods.
+
+## Table schema
+
+Create the following table in your database before starting the worker:
+
+```sql
+CREATE TABLE webhook_outbox (
+  id text PRIMARY KEY,
+  event_id text NOT NULL,
+  event_type text NOT NULL,
+  subject text,
+  body text NOT NULL,
+  url text NOT NULL,
+  secret text,
+  attempts int NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  claimed_at timestamptz,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON webhook_outbox (status, next_attempt_at);
+CREATE INDEX ON webhook_outbox (subject);
+```
+
+The `claimed_at` column is not part of the `OutboxRow` interface — it is an implementation detail of your adapter, used for lease tracking. The worker never sees it; only your claim query reads and writes it.
+
+## Index strategy
+
+The two indexes serve distinct query patterns:
+
+- **`(status, next_attempt_at)`** covers the worker's polling query. Every tick filters on `status = 'pending'` and `next_attempt_at <= now`, then sorts by `next_attempt_at` to process oldest-due rows first. Without this index the worker does a full-table sequential scan on every poll interval.
+- **`(subject)`** covers per-tenant operational queries: "show me all outbox rows for `acct_42`", "list dead-letter failures for this customer". You will reach for this whenever you triage a support ticket or replay deliveries for a specific account.
+
+If you serve many tenants and run frequent per-tenant dead-letter queries, consider a partial index — for example, `CREATE INDEX ON webhook_outbox (subject) WHERE status = 'dead'` — to keep it narrow.
+
+## The leasing claim query
+
+The claim query must atomically select and mark rows in a single statement to prevent double-delivery across concurrent workers:
+
+```sql
+UPDATE webhook_outbox SET claimed_at = now()
+WHERE id IN (
+  SELECT id FROM webhook_outbox
+  WHERE status = 'pending' AND next_attempt_at <= $1
+    AND (claimed_at IS NULL OR claimed_at < now() - INTERVAL '2 minutes')
+  ORDER BY next_attempt_at
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+Pass `now` as `$1` and your batch size as `$2`. The `FOR UPDATE SKIP LOCKED` in the subquery ensures two racing workers never compete for the same candidate rows. The outer `UPDATE` stamps `claimed_at` inside the same atomic operation, so the lease survives the transaction commit. Any row left with a stale `claimed_at` — because the worker that claimed it crashed before completing delivery — becomes reclaimable after the two-minute window.
+
+Map the snake_case columns back to camelCase when you return `OutboxRow` objects from `claim`:
+
+```typescript
+function rowToOutboxRow(row: Record<string, unknown>): OutboxRow {
+  return {
+    id: row.id as string,
+    eventId: row.event_id as string,
+    eventType: row.event_type as string,
+    subject: (row.subject as string | null) ?? null,
+    body: row.body as string,
+    url: row.url as string,
+    secret: (row.secret as string | null) ?? null,
+    attempts: row.attempts as number,
+    nextAttemptAt: new Date(row.next_attempt_at as string),
+    status: row.status as OutboxRow["status"],
+    lastError: (row.last_error as string | null) ?? null,
+    createdAt: new Date(row.created_at as string),
+  };
+}
+```
+
+## Wiring the five adapter methods
+
+Here is a TypeScript sketch using `pg` (node-postgres) that maps each `OutboxAdapter` method to the corresponding SQL. Swap the query layer for your ORM or query builder of choice:
+
+```typescript
+import { Pool, PoolClient } from "pg";
+import type { OutboxAdapter, OutboxRow } from "@webhooks/sdk";
+
+export function postgresAdapter(pool: Pool): OutboxAdapter<PoolClient> {
+  return {
+    async insert(rows, tx) {
+      const client = tx ?? pool;
+      for (const row of rows) {
+        await client.query(
+          `INSERT INTO webhook_outbox
+             (id, event_id, event_type, subject, body, url, secret,
+              attempts, next_attempt_at, status, last_error, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            row.id,
+            row.eventId,
+            row.eventType,
+            row.subject,
+            row.body,
+            row.url,
+            row.secret,
+            row.attempts,
+            row.nextAttemptAt,
+            row.status,
+            row.lastError,
+            row.createdAt,
+          ],
+        );
+      }
+    },
+
+    async claim(limit, now) {
+      const result = await pool.query(
+        `UPDATE webhook_outbox SET claimed_at = now()
+         WHERE id IN (
+           SELECT id FROM webhook_outbox
+           WHERE status = 'pending' AND next_attempt_at <= $1
+             AND (claimed_at IS NULL OR claimed_at < now() - INTERVAL '2 minutes')
+           ORDER BY next_attempt_at
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED
+         )
+         RETURNING *`,
+        [now, limit],
+      );
+      return result.rows.map(rowToOutboxRow);
+    },
+
+    async complete(rowId) {
+      await pool.query(
+        `UPDATE webhook_outbox SET status = 'delivered' WHERE id = $1`,
+        [rowId],
+      );
+    },
+
+    async retry(rowId, attempts, nextAttemptAt, lastError) {
+      await pool.query(
+        `UPDATE webhook_outbox
+         SET attempts = $2, next_attempt_at = $3, last_error = $4
+         WHERE id = $1`,
+        [rowId, attempts, nextAttemptAt, lastError],
+      );
+    },
+
+    async dead(rowId, attempts, lastError) {
+      await pool.query(
+        `UPDATE webhook_outbox
+         SET status = 'dead', attempts = $2, last_error = $3
+         WHERE id = $1`,
+        [rowId, attempts, lastError],
+      );
+    },
+  };
+}
+```
+
+Pass a `PoolClient` as the transaction handle when you call `wh.with(tx).send(...)`:
+
+```typescript
+const adapter = postgresAdapter(pool);
+
+const wh = webhooks({
+  events,
+  subscribers,
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+  delivery: outbox(adapter, { maxAttempts: 20 }),
+});
+
+// Both writes commit or roll back together
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query(
+    "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+    [invoice.id, invoice.amountCents],
+  );
+  await wh.with(client).send({
+    event: "invoice.paid",
+    subject: `acct_${invoice.accountId}`,
+    data: { invoiceId: invoice.id, amountCents: invoice.amountCents },
+  });
+  await client.query("COMMIT");
+} catch (err) {
+  await client.query("ROLLBACK");
+  throw err;
+} finally {
+  client.release();
+}
+```
+
+<Tip>
+  The `secret` column stores signing secrets as plain text by default. If that concerns you — for example, because your database backups are not encrypted at rest — you can encrypt the value before inserting and decrypt it inside your `claim` mapping function before returning `OutboxRow` objects. The README notes this explicitly: the column is "stored as-is; encrypt or resolve at delivery time if that worries you." The SDK never reads the column directly; it only sees what your adapter returns.
+</Tip>
+
+<Note>
+  The `subject` column is what makes dead-letter triage tractable in multi-tenant systems. When a customer reports missing webhook events, you can query `SELECT * FROM webhook_outbox WHERE subject = 'acct_42' AND status = 'dead'` to find exactly which deliveries failed for their account, inspect `last_error`, fix the underlying issue, reset `status` to `'pending'` and `claimed_at` to `NULL`, and the worker will retry on the next poll cycle. Without `subject`, you would need to join through your own tables to scope failures per tenant.
+</Note>

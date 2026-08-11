@@ -1,0 +1,132 @@
+---
+title: "In-Memory Outbox Adapter for Testing and Development"
+sidebarTitle: "Memory Adapter"
+description: "Use memoryAdapter() to run the full outbox pipeline in tests and local development without a real database — inspect rows and transactions directly."
+---
+
+The `memoryAdapter()` function returns a fully working `OutboxAdapter` that stores rows in a plain JavaScript array. It implements all five interface methods — `insert`, `claim`, `complete`, `retry`, and `dead` — so you can run the complete outbox pipeline, including worker delivery, without a database. You will reach for it in unit tests, integration tests, and local development workflows where spinning up a real Postgres instance is inconvenient or unnecessary.
+
+## Importing and wiring
+
+`memoryAdapter` is a named export from `@webhooks/sdk`:
+
+```typescript
+import { memoryAdapter, outbox, webhooks } from "@webhooks/sdk";
+```
+
+Wire it into a `webhooks()` instance exactly as you would a production adapter:
+
+```typescript
+import { memoryAdapter, outbox, webhooks } from "@webhooks/sdk";
+import { z } from "zod";
+
+const events = {
+  "invoice.paid": z.object({ invoiceId: z.string(), amountCents: z.number() }),
+};
+
+const adapter = memoryAdapter();
+
+const wh = webhooks({
+  events,
+  subscribers: [{ url: "https://example.com/hooks", secret: "test-secret" }],
+  signing: { secret: "test-secret" },
+  delivery: outbox(adapter),
+});
+```
+
+## Using `memoryAdapter()` in a test
+
+The adapter drops straight into any test runner. Here is a complete example that verifies the outbox pipeline end-to-end without network calls or a database:
+
+```typescript
+import { describe, it, expect, vi } from "vitest";
+import { memoryAdapter, outbox, webhooks } from "@webhooks/sdk";
+import { z } from "zod";
+
+describe("invoice.paid outbox delivery", () => {
+  it("enqueues a row and delivers it via the worker", async () => {
+    // Stub fetch so no real HTTP request is made
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+
+    const adapter = memoryAdapter();
+    const wh = webhooks({
+      events: {
+        "invoice.paid": z.object({
+          invoiceId: z.string(),
+          amountCents: z.number(),
+        }),
+      },
+      subscribers: [{ url: "https://example.com/hooks", secret: "whsec_dGVzdA==" }],
+      signing: { secret: "whsec_dGVzdA==" },
+      delivery: outbox(adapter, { maxAttempts: 3 }),
+    });
+
+    // send() inserts into the adapter — no HTTP yet
+    const result = await wh.send({
+      event: "invoice.paid",
+      subject: "acct_42",
+      data: { invoiceId: "inv_1", amountCents: 4200 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(adapter.rows).toHaveLength(1);
+    expect(adapter.rows[0]!.status).toBe("pending");
+    expect(adapter.rows[0]!.eventType).toBe("invoice.paid");
+    expect(adapter.rows[0]!.subject).toBe("acct_42");
+
+    // One worker tick delivers the row
+    const worker = wh.worker({ fetchImpl: fetchMock });
+    const report = await worker.tick();
+
+    expect(report.claimed).toBe(1);
+    expect(report.delivered).toBe(1);
+    expect(report.retried).toBe(0);
+    expect(adapter.rows[0]!.status).toBe("delivered");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("stores the transaction handle passed to insert", async () => {
+    const adapter = memoryAdapter();
+    const wh = webhooks({
+      events: {
+        "invoice.paid": z.object({ invoiceId: z.string(), amountCents: z.number() }),
+      },
+      subscribers: [{ url: "https://example.com/hooks", secret: "test-secret" }],
+      signing: { secret: "test-secret" },
+      delivery: outbox(adapter),
+    });
+
+    const fakeTx = { __isFakeTx: true };
+    await wh.with(fakeTx).send({
+      event: "invoice.paid",
+      subject: "acct_1",
+      data: { invoiceId: "inv_2", amountCents: 100 },
+    });
+
+    // Confirm insert received the transaction handle
+    expect(adapter.lastTx).toBe(fakeTx);
+  });
+});
+```
+
+## The `MemoryAdapter` interface
+
+`memoryAdapter()` returns a `MemoryAdapter`, which extends `OutboxAdapter<unknown>` with two additional properties for test introspection:
+
+```typescript
+export interface MemoryAdapter extends OutboxAdapter<unknown> {
+  rows: OutboxRow[];
+  lastTx: unknown;
+}
+```
+
+- **`rows`** — the live array of every `OutboxRow` the adapter holds. Mutations made by `complete`, `retry`, and `dead` are applied in place, so you can assert on `rows[0]!.status` after a `worker.tick()` without any extra setup.
+- **`lastTx`** — the most recent transaction value passed to `insert`. Because `MemoryAdapter` is typed as `OutboxAdapter<unknown>`, it accepts any value as `tx`. In tests you typically pass a sentinel object and assert `adapter.lastTx === yourSentinel` to confirm that `wh.with(tx)` is correctly threaded through to the adapter.
+
+<Warning>
+  `memoryAdapter()` is designed for **single-worker use only**. Its `claim` implementation is a filtered array scan — there is no lease, no `claimed_at` timestamp, and no concurrency control. Running two workers against the same `memoryAdapter` instance will cause double-delivery. This is intentional: the memory adapter exists to make tests fast and straightforward, not to simulate the leasing behaviour you must implement in production adapters.
+</Warning>
+
+<Tip>
+  Use `adapter.rows` and `adapter.lastTx` as your primary assertion surface in tests. You do not need to mock individual adapter methods — instead, drive the system through the real `wh.send()` and `worker.tick()` calls, then inspect the array directly. This tests the full pipeline — schema validation, subscriber resolution, row construction, worker delivery, and status transitions — without any stubbing of internal SDK behaviour.
+</Tip>

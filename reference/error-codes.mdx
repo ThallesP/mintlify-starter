@@ -1,0 +1,151 @@
+---
+title: "Error Codes and Result Types in Standard Webhooks"
+sidebarTitle: "Error Codes"
+description: "A complete reference for SDK send() error strings, VerifyFailure codes, and the Result<T> pattern used throughout the library."
+---
+
+Standard Webhooks takes a deliberate position on errors: failures that can happen at request time are returned as values, not thrown as exceptions. The `Result<T>` type — `{ ok: true; value: T } | { ok: false; error: string }` — is the return type of every `send()` call, and `VerifyResult<T>` plays the same role on the consumer side. You check `result.ok` with a plain `if` statement and handle the failure inline. The only time the library throws is during construction — an invalid secret or an illegal configuration value fails loudly at boot instead of silently misbehaving at request time.
+
+<Tip>
+  Use the `if (!result.ok)` pattern rather than wrapping `send()` or `verify()` in a `try/catch`. Neither method ever rejects its promise under normal operation — a `try/catch` would hide the error path and make it easy to accidentally proceed with an unverified payload or an unsent event.
+
+  ```ts
+  const result = await wh.send({ event: "invoice.paid", subject: "acct_1", data });
+  if (!result.ok) {
+    // result.error is a string describing exactly what went wrong
+    logger.error("webhook send failed", { error: result.error });
+    return;
+  }
+  // result.value.eventId, result.value.deliveries, etc.
+  ```
+</Tip>
+
+---
+
+## SDK `send()` Error Strings
+
+Every `send()` call goes through a `prepare()` step that validates the input, resolves subscribers, and checks signing secrets before any HTTP request is made. If preparation fails, `send()` resolves to `{ ok: false, error: "<string>" }`. The possible error strings are listed below.
+
+### Subject errors
+
+<ResponseField name='event "${event}" requires a subject'>
+  You called `send()` without a `subject` field, but the `WebhooksConfig` does not have `subject: "optional"`. Subject is required by default. Either pass `subject` in the `SendInput` or configure `subject: "optional"` on the `webhooks()` factory if your use case genuinely has no domain entity to identify.
+</ResponseField>
+
+<ResponseField name="subject must be a non-empty string">
+  You passed `subject: ""` (an empty string). Subject must either be omitted (when `subject: "optional"` is configured) or be a non-empty string.
+</ResponseField>
+
+### Event type errors
+
+<ResponseField name='unknown event type "${event}"'>
+  The `event` key you passed to `send()` does not exist in the `events` map you provided to `webhooks()`. Check for typos in the event name. Note that prototype-inherited keys (e.g. `"toString"`, `"constructor"`) are also rejected — only own properties of the `events` object are accepted.
+</ResponseField>
+
+### Schema validation errors
+
+<ResponseField name='schema validation threw for "${event}": …'>
+  The Standard Schema validator for this event threw a synchronous exception or returned a rejected promise during validation. The string after the colon is the `String(cause)` of the thrown value. This usually indicates a bug in the validator itself rather than invalid user data — check your schema definition.
+</ResponseField>
+
+<ResponseField name='invalid payload for "${event}": …'>
+  The validator returned an issues array (the Standard Schema failure shape). The error string contains each issue's `message` joined by `"; "`. Fix the `data` you are passing to match the schema.
+</ResponseField>
+
+### Serialization error
+
+<ResponseField name='payload for "${event}" is not JSON-serializable: …'>
+  `JSON.stringify` threw while serializing the validated payload. This happens when the output of your schema contains a `BigInt`, a circular reference, a `Function`, or another value that JSON cannot represent. The error string contains `String(cause)` from the stringify failure.
+</ResponseField>
+
+### Subscriber resolver error
+
+<ResponseField name="subscriber resolver failed: …">
+  Your `SubscriberResolver` function threw a synchronous exception or returned a rejected promise. The error string contains `String(cause)`. This could be a database error, a network timeout on the lookup, or a bug in your resolver. No delivery is attempted.
+</ResponseField>
+
+### Signing secret errors
+
+<ResponseField name="no signing secret for subscriber ${url}">
+  A subscriber was resolved (either from a static array or a resolver) with no `secret` field, and no fallback `signing.secret` is configured on `WebhooksConfig`. Every subscriber must have a signing secret — either set `signing: { secret: "..." }` in the top-level config, or include a `secret` on each `Subscriber` object.
+</ResponseField>
+
+<ResponseField name='invalid signing secret for subscriber ${url}: "whsec_" secrets must contain non-empty base64'>
+  A subscriber's resolved secret starts with `whsec_` but the base64 portion after the prefix is empty or contains characters that are not valid standard base64. Generate a valid secret with `echo "whsec_$(openssl rand -base64 32)"` or use `isValidSecret(secret)` to validate a secret before storing it.
+</ResponseField>
+
+---
+
+## Verify `VerifyFailure` Codes
+
+On the consumer side, `verifier.verify()` and `verifier.verifyPayload()` return `{ ok: false, reason: VerifyFailure }` for every verification problem. No exceptions are thrown.
+
+| Code | Meaning |
+|---|---|
+| `missing_headers` | One or more of `webhook-id`, `webhook-timestamp`, or `webhook-signature` (or `svix-*` equivalents) are absent. |
+| `invalid_id` | The `webhook-id` contains a `.` — dots are forbidden because they make the signed string ambiguous. |
+| `invalid_timestamp` | `webhook-timestamp` is not a decimal integer string. |
+| `timestamp_out_of_tolerance` | The timestamp differs from server time by more than `toleranceSec` seconds (default 300). |
+| `invalid_signature` | None of the up-to-8 signature candidates in `webhook-signature` matched the expected HMAC. |
+| `invalid_secret` | The HMAC key could not be imported by WebCrypto at request time. |
+| `unreadable_body` | The `Request` body stream was already consumed or errored (fetch-style path only). |
+| `invalid_json` | The body passed HMAC verification but is not valid JSON. |
+
+For full descriptions of each code, see the [Verify API reference](/reference/verify-api).
+
+---
+
+## Constructor Throws
+
+A small number of programming errors are detected at construction time and throw `RangeError` immediately. These are intentionally loud — they fail the deploy or the startup sequence rather than silently accepting broken requests later.
+
+### `createVerifier(secret, opts?)`
+
+| Condition | Message |
+|---|---|
+| `secret` is empty, or starts with `whsec_` but has empty/invalid base64 | `invalid webhook secret: must be non-empty, and "whsec_" secrets must contain non-empty base64` |
+| `opts.toleranceSec` is `NaN`, `Infinity`, or negative | `toleranceSec must be a non-negative finite number, got <value>` |
+
+```ts
+// Both throw RangeError at the call site — not on the first request
+createVerifier("");
+createVerifier("whsec_!!!invalid!!!");
+createVerifier("valid", { toleranceSec: NaN });
+```
+
+### `direct(opts?)` and `outbox(adapter, opts?)`
+
+| Condition | Message |
+|---|---|
+| `opts.maxAttempts` is not a positive integer (includes `0`, `-1`, `1.5`, `NaN`) | `maxAttempts must be a positive integer, got <value>` |
+
+```ts
+direct({ maxAttempts: 0 });     // RangeError
+outbox(adapter, { maxAttempts: 1.5 }); // RangeError
+```
+
+---
+
+## Result Type Reference
+
+The `Result<T, E>` type is exported from `@webhooks/sdk` for use in your own code.
+
+```ts
+type Result<T, E = string> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+```
+
+The `ok` and `err` constructor functions are also exported:
+
+```ts
+import { ok, err, type Result } from "@webhooks/sdk";
+
+function divide(a: number, b: number): Result<number> {
+  if (b === 0) return err("division by zero");
+  return ok(a / b);
+}
+
+const result = divide(10, 0);
+if (!result.ok) console.error(result.error); // "division by zero"
+```

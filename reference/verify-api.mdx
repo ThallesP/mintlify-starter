@@ -1,0 +1,227 @@
+---
+title: "@webhooks/verify API Reference"
+sidebarTitle: "Verify API"
+description: "Complete API reference for @webhooks/verify — createVerifier, the Verifier interface, VerifyResult, VerifyFailure codes, and HeadersLike."
+---
+
+The `@webhooks/verify` package is the consumer-side library. It has zero dependencies and uses the WebCrypto API, so it runs on Node 20+, Bun, Deno, Cloudflare Workers, and any edge runtime that exposes a global `crypto.subtle`. You create a `Verifier` once at startup and call it on every incoming webhook request.
+
+---
+
+## Functions
+
+### `createVerifier(secret, opts?)`
+
+Constructs a `Verifier` that verifies Standard Webhooks signatures for a single signing secret. Call this once at module load time — it imports the HMAC key eagerly so the first request doesn't pay the key-import cost.
+
+```ts
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+```
+
+<ParamField path="secret" type="string" required>
+  The signing secret shared with the sender. Accepts both the `whsec_<base64>` format (base64-decoded before use as HMAC key bytes) and plain UTF-8 strings (used as raw bytes). Must be non-empty. For `whsec_` secrets, the base64 suffix must be valid and non-empty.
+
+  Throws `RangeError` immediately if the secret is invalid — a malformed secret fails at boot rather than silently accepting or rejecting every request at runtime.
+</ParamField>
+
+<ParamField path="opts.toleranceSec" type="number" default="300">
+  How far from the current server time (in either direction) a webhook's timestamp is accepted, measured in seconds. Requests with a `webhook-timestamp` older or newer than this window are rejected with `timestamp_out_of_tolerance`. The default of 300 seconds (5 minutes) matches the Standard Webhooks specification.
+
+  Must be a non-negative finite number. Passing `NaN`, `Infinity`, or a negative value throws `RangeError` at construction time — an invalid tolerance would make the timestamp check fail open, accepting replays indefinitely.
+</ParamField>
+
+**Throws `RangeError`** in two cases at construction time (not at verify time):
+
+- The `secret` is empty, or starts with `whsec_` but the base64 suffix is empty or malformed.
+- `opts.toleranceSec` is not a non-negative finite number.
+
+```ts
+// These throw immediately — loud at boot, not at request time
+createVerifier("");                         // RangeError: invalid webhook secret
+createVerifier("whsec_");                   // RangeError: invalid webhook secret
+createVerifier("valid-secret", { toleranceSec: -1 });   // RangeError: toleranceSec …
+createVerifier("valid-secret", { toleranceSec: NaN });  // RangeError: toleranceSec …
+```
+
+---
+
+## Interface: Verifier
+
+The object returned by `createVerifier()`. Provides two methods — one for fetch-style frameworks and one for Node.js frameworks.
+
+```ts
+interface Verifier {
+  verify<T = unknown>(request: Request): Promise<VerifyResult<T>>;
+  verifyPayload<T = unknown>(
+    payload: string | Uint8Array,
+    headers: HeadersLike,
+  ): Promise<VerifyResult<T>>;
+}
+```
+
+---
+
+### `verify<T>(request)`
+
+Fetch-style entry point. Accepts a standard `Request` object (Web API). Reads the body as raw bytes — this preserves the exact bytes that were signed, avoiding any UTF-8 normalisation or BOM stripping that `text()` would apply.
+
+```ts
+// Next.js App Router
+export async function POST(req: Request) {
+  const result = await verifier.verify(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  const { id, timestamp, payload } = result;
+  return new Response(null, { status: 204 });
+}
+```
+
+<ParamField path="request" type="Request" required>
+  The incoming `Request` object. The body is consumed once — if you need it again (e.g. to pass to another handler), clone the request before calling `verify`: `verifier.verify(req.clone())`.
+</ParamField>
+
+Returns `Promise<VerifyResult<T>>`. Returns `{ ok: false, reason: "unreadable_body" }` if the body stream cannot be read rather than throwing.
+
+<Note>
+  Headers are checked before the body is buffered. If the request is rejectable from headers alone (missing, invalid timestamp, replay), the body is never read — useful for defending against large-payload denial-of-service attempts.
+</Note>
+
+---
+
+### `verifyPayload<T>(payload, headers)`
+
+Node.js-style entry point. Use this with Express, Fastify, or any framework where you have access to the raw body buffer and a headers object.
+
+```ts
+// Express — must use raw body middleware
+app.post("/hook", express.raw({ type: "application/json" }), async (req, res) => {
+  const result = await verifier.verifyPayload(req.body, req.headers);
+  if (!result.ok) return res.status(400).end();
+  res.status(204).end();
+});
+```
+
+<ParamField path="payload" type="string | Uint8Array" required>
+  The raw, unparsed request body. Pass the `Buffer` or `Uint8Array` directly from your framework — do **not** parse to JSON and re-serialize. JSON parsing and re-serialisation changes whitespace and key ordering, which breaks the HMAC check.
+</ParamField>
+
+<ParamField path="headers" type="HeadersLike" required>
+  The request headers. Accepts both a `Headers` instance (Web API) and a plain `Record<string, string | string[] | undefined>` (Node.js `IncomingHttpHeaders`). Header lookup is case-insensitive.
+</ParamField>
+
+Returns `Promise<VerifyResult<T>>`. Never throws — all failure paths are encoded as `{ ok: false, reason: VerifyFailure }`.
+
+---
+
+## Types
+
+### `VerifyResult<T>`
+
+The return type of both `verify()` and `verifyPayload()`. A discriminated union on `ok`.
+
+```ts
+type VerifyResult<T> =
+  | { ok: true; id: string; timestamp: Date; payload: T }
+  | { ok: false; reason: VerifyFailure };
+```
+
+<Expandable title="Success fields">
+
+<ResponseField name="ok" type="true">
+  Always `true` on the success branch.
+</ResponseField>
+
+<ResponseField name="id" type="string">
+  The value of the `webhook-id` header (or `svix-id`). This is the event's stable, globally unique ID — the same value is sent on every retry of the same event. Use it to deduplicate on the consumer side.
+</ResponseField>
+
+<ResponseField name="timestamp" type="Date">
+  The time the event was originally sent, constructed from the `webhook-timestamp` header (Unix seconds).
+</ResponseField>
+
+<ResponseField name="payload" type="T">
+  The parsed JSON body, typed as `T`. The verifier proves the body was signed by the expected secret but does not validate its shape — if you need runtime schema validation, pass the result to a Zod/Valibot parser after checking `result.ok`.
+</ResponseField>
+
+</Expandable>
+
+<Expandable title="Failure fields">
+
+<ResponseField name="ok" type="false">
+  Always `false` on the failure branch.
+</ResponseField>
+
+<ResponseField name="reason" type="VerifyFailure">
+  A string reason code describing why verification failed. See `VerifyFailure` below.
+</ResponseField>
+
+</Expandable>
+
+---
+
+### `VerifyFailure`
+
+A string literal union of all possible verification failure reasons. Every failure returns one of these codes — no exceptions are thrown.
+
+```ts
+type VerifyFailure =
+  | "missing_headers"
+  | "invalid_id"
+  | "invalid_timestamp"
+  | "timestamp_out_of_tolerance"
+  | "invalid_signature"
+  | "invalid_secret"
+  | "unreadable_body"
+  | "invalid_json";
+```
+
+<ResponseField name="missing_headers" type="VerifyFailure">
+  One or more of the required headers — `webhook-id`, `webhook-timestamp`, or `webhook-signature` (or their `svix-*` equivalents) — are absent or empty. Check that your sender is setting all three headers.
+</ResponseField>
+
+<ResponseField name="invalid_id" type="VerifyFailure">
+  The `webhook-id` header contains a `.` character. Dots are forbidden in event IDs because the signed message is `{id}.{timestamp}.{body}` — a dot in the ID shifts the boundaries of that string, making it possible to construct a different `(id, timestamp, body)` triple that produces the same valid signature.
+</ResponseField>
+
+<ResponseField name="invalid_timestamp" type="VerifyFailure">
+  The `webhook-timestamp` header value cannot be parsed as an integer. Valid timestamps are Unix epoch seconds represented as a decimal integer string.
+</ResponseField>
+
+<ResponseField name="timestamp_out_of_tolerance" type="VerifyFailure">
+  The timestamp differs from the current server time by more than `toleranceSec` seconds (default 300). This is the replay-attack guard. If you see this in production, check for clock skew between sender and receiver, or increase `toleranceSec` cautiously.
+</ResponseField>
+
+<ResponseField name="invalid_signature" type="VerifyFailure">
+  None of the `v1,<base64>` candidates in the `webhook-signature` header matched the HMAC-SHA256 computed over `{id}.{timestamp}.{body}`. At most 8 candidates are tried per request. Common causes: wrong secret, body was parsed and re-serialized before verification, or the event was not sent by the expected sender.
+</ResponseField>
+
+<ResponseField name="invalid_secret" type="VerifyFailure">
+  The HMAC key could not be imported by WebCrypto. This is rare at request time (the key is imported eagerly at construction) — it can appear if the runtime's `crypto.subtle.importKey` rejects a key that `isValidSecret` accepted.
+</ResponseField>
+
+<ResponseField name="unreadable_body" type="VerifyFailure">
+  The body stream on the `Request` object could not be read — the stream was already consumed, aborted, or an error was thrown. Only possible via the `verify(request)` path; `verifyPayload()` accepts the body as a value and never returns this code.
+</ResponseField>
+
+<ResponseField name="invalid_json" type="VerifyFailure">
+  The body passed HMAC verification but could not be parsed as JSON. The `payload` field of a successful result is always valid JSON.
+</ResponseField>
+
+---
+
+### `HeadersLike`
+
+```ts
+type HeadersLike = Headers | Record<string, string | string[] | undefined>;
+```
+
+The `headers` argument accepted by `verifyPayload()`. Both forms are supported:
+
+- **`Headers`** — the Web API `Headers` object (fetch-style frameworks, `new Headers({...})`).
+- **`Record<string, string | string[] | undefined>`** — Node.js `IncomingHttpHeaders` (Express `req.headers`, Fastify `request.headers`). Header names are looked up case-insensitively, so both `"Content-Type"` and `"content-type"` resolve correctly.
+
+<Tip>
+  When using `verifyPayload()` with Express, pass `req.headers` directly — it is already a `Record<string, string | string[] | undefined>` and does not need to be converted.
+</Tip>

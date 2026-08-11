@@ -1,0 +1,139 @@
+---
+title: "Typed Webhook Payloads Using EventUnion"
+sidebarTitle: "Typed Events"
+description: "Get fully-typed webhook payloads in TypeScript by importing EventUnion from the sender's package — zero runtime dependency required."
+---
+
+When the sender of your webhooks also ships a TypeScript SDK, you can get a fully-typed `payload` object out of `verifier.verify()` — complete with discriminated-union narrowing in `switch` statements — without adding any runtime dependency on that SDK. All you need is a single type-only import.
+
+## How the sender exposes the event union
+
+On the sender's side, the developer defines a map of event names to Zod (or any Standard Schema-compatible) schemas and exports a computed `EventUnion` type:
+
+```typescript
+// Inside the sender's package (e.g. acme-sdk)
+import { webhooks } from "@webhooks/sdk";
+import { z } from "zod";
+
+const events = {
+  "invoice.paid": z.object({ invoiceId: z.string(), amountCents: z.number() }),
+  "user.created": z.object({ userId: z.string(), email: z.string() }),
+};
+
+// This type is the only thing consumers need
+export type Events = EventUnion<typeof events>;
+```
+
+`EventUnion` produces a discriminated union with one member per event name, shaped as:
+
+```typescript
+type Events =
+  | { event: "invoice.paid"; subject: string | null; data: { invoiceId: string; amountCents: number } }
+  | { event: "user.created";  subject: string | null; data: { userId: string;   email: string        } }
+```
+
+## Using the type on the consumer side
+
+In your own codebase, import `Events` as a **type-only** import. TypeScript erases type-only imports at compile time — they produce no `require()` or `import()` in the emitted JavaScript, so `acme-sdk` is not part of your runtime bundle at all.
+
+```typescript
+import type { Events } from "acme-sdk"; // type-only — zero runtime cost
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+export async function POST(req: Request) {
+  // Pass the Events type as a type parameter
+  const result = await verifier.verify<Events>(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  // result.payload is now typed as Events
+  result.payload.subject; // string | null — authenticated, lives inside the signed body
+
+  switch (result.payload.event) {
+    case "invoice.paid":
+      // TypeScript narrows: result.payload.data is { invoiceId: string; amountCents: number }
+      console.log(result.payload.data.amountCents);
+      break;
+
+    case "user.created":
+      // TypeScript narrows: result.payload.data is { userId: string; email: string }
+      console.log(result.payload.data.email);
+      break;
+  }
+
+  return new Response(null, { status: 204 });
+}
+```
+
+<Tip>
+  If the sender's package is not yet on npm (or you want to avoid even a dev-dependency), you can copy-paste the `Events` type definition directly into your repo. Because it's type-only, there's nothing to keep in sync at runtime.
+</Tip>
+
+## Wire types vs schema types: `Jsonify<T>`
+
+`EventUnion` gives you **wire types** — what the payload looks like after it has been JSON-serialised by the sender and JSON-parsed by the verifier. This is important: it may differ from the schema's output type in ways that matter.
+
+`EventUnion` applies the `Jsonify<T>` utility type to each schema's output before building the union. `Jsonify<T>` approximates what `JSON.stringify` + `JSON.parse` does to a value:
+
+| Schema type | Wire type (`Jsonify`) | Reason |
+|---|---|---|
+| `z.string()` | `string` | No change |
+| `z.number()` | `number` | No change |
+| `z.boolean()` | `boolean` | No change |
+| `z.date()` | `string` | `Date.prototype.toJSON()` serialises to ISO-8601 string |
+| `z.bigint()` | `never` | `bigint` is not JSON-serialisable; `send()` returns an error for it |
+| `z.object({…})` | `{ [K]: Jsonify<…> }` | Recursively applied |
+
+```typescript
+// Sender schema
+const events = {
+  "report.generated": z.object({
+    reportId: z.string(),
+    generatedAt: z.date(),   // Date on the sender side…
+  }),
+};
+
+// Consumer wire type (via EventUnion + Jsonify)
+// result.payload.data.generatedAt is `string`, not `Date`
+// You must construct the Date yourself: new Date(result.payload.data.generatedAt)
+```
+
+## Validating shape when the secret is shared
+
+<Warning>
+  The verifier proves **who sent** the payload — it does not prove the payload's shape. `result.payload` is parsed JSON cast to `T` by assertion. If the signing secret is shared with parties you don't fully trust, or if you need to defend against a compromised sender sending unexpected fields, validate the payload shape yourself with your own schema after verification.
+</Warning>
+
+```typescript
+import type { Events } from "acme-sdk";
+import { createVerifier } from "@webhooks/verify";
+import { z } from "zod";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+// Your own defensive schema — independent of the sender's type
+const invoicePaidSchema = z.object({
+  event: z.literal("invoice.paid"),
+  subject: z.string().nullable(),
+  data: z.object({
+    invoiceId: z.string(),
+    amountCents: z.number().int().nonnegative(),
+  }),
+});
+
+export async function POST(req: Request) {
+  const result = await verifier.verify<Events>(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  if (result.payload.event === "invoice.paid") {
+    // Parse validates shape in addition to the cryptographic proof
+    const parsed = invoicePaidSchema.safeParse(result.payload);
+    if (!parsed.success) return new Response("unexpected payload shape", { status: 422 });
+
+    console.log(parsed.data.data.amountCents);
+  }
+
+  return new Response(null, { status: 204 });
+}
+```

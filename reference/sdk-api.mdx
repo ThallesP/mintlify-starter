@@ -1,0 +1,690 @@
+---
+title: "@webhooks/sdk API Reference"
+sidebarTitle: "SDK API"
+description: "Complete API reference for @webhooks/sdk — factory functions, delivery config, types, and the outbox adapter interface."
+---
+
+The `@webhooks/sdk` package is the producer-side library. It lets you define a typed event map, configure how webhooks are delivered (directly in-process or durably via an outbox table), and call `send()` with type-narrowed payloads. Every public export is documented below.
+
+---
+
+## Functions
+
+### `webhooks(config)`
+
+The main factory. Returns a `DirectWebhooks` instance when no `delivery` is specified (or when `direct()` is passed) and an `OutboxWebhooks` instance when `outbox(...)` is passed. The return type is narrowed at compile time — `with(tx)` and `worker()` are only present on `OutboxWebhooks`.
+
+```ts
+import { webhooks, direct, outbox } from "@webhooks/sdk";
+
+// Direct delivery (default)
+const wh = webhooks({ events, subscribers, signing, delivery: direct() });
+
+// Outbox delivery
+const wh = webhooks({ events, subscribers, signing, delivery: outbox(myAdapter) });
+```
+
+<ParamField path="config.events" type="EventMap" required>
+  A plain object whose keys are event-type strings and whose values are [Standard Schema v1](https://github.com/standard-schema/standard-schema) validators (Zod v3.24+, Valibot, ArkType, etc.). Each value's `Input` type becomes the accepted shape for `data` in `send()`.
+</ParamField>
+
+<ParamField path="config.subscribers" type="Subscriber[] | SubscriberResolver" required>
+  Who receives events. Pass a static array for single-endpoint setups or a resolver function for multi-tenant lookups. The resolver is called with `{ event, subject, data }` and must return `Subscriber[]` or a `Promise<Subscriber[]>`.
+</ParamField>
+
+<ParamField path="config.signing" type="{ secret: string }">
+  The default signing secret used for any subscriber that doesn't carry its own `secret` field. If every subscriber in your list includes a `secret`, this field is optional — but `send()` will return an error for any subscriber that has no secret at all.
+</ParamField>
+
+<ParamField path="config.subject" type='"optional"'>
+  By default, `subject` is required on every `send()` call. Pass `"optional"` to relax that constraint — useful for single-tenant or internal setups where there is genuinely no domain entity to identify.
+</ParamField>
+
+<ParamField path="config.delivery" type="DirectDelivery | OutboxDelivery<Tx>">
+  The delivery strategy. Defaults to `direct()` when omitted. Pass `outbox(adapter)` to switch to durable outbox mode.
+</ParamField>
+
+---
+
+### `direct(opts?)`
+
+Returns a `DirectDelivery` configuration object. Delivery happens inline inside `send()`, with in-process retries. A process crash mid-retry loses queued attempts.
+
+```ts
+import { direct } from "@webhooks/sdk";
+
+const delivery = direct({
+  maxAttempts: 5,
+  backoffMs: (attempts) => Math.min(30_000, 500 * 2 ** (attempts - 1)),
+  timeoutMs: 10_000,
+});
+```
+
+<ParamField path="opts.maxAttempts" type="number" default="5">
+  Maximum number of HTTP delivery attempts per subscriber. Must be a positive integer — a non-integer or value less than 1 throws `RangeError` at construction time.
+</ParamField>
+
+<ParamField path="opts.backoffMs" type="(attempts: number) => number">
+  A function that returns the delay in milliseconds before the next attempt. `attempts` starts at `1` after the first failure. The default is exponential backoff capped at 30 seconds: `Math.min(30_000, 500 * 2 ** (attempts - 1))`.
+</ParamField>
+
+<ParamField path="opts.timeoutMs" type="number" default="10000">
+  Per-request timeout in milliseconds. Requests that take longer than this are aborted and treated as failed attempts.
+</ParamField>
+
+<ParamField path="opts.fetchImpl" type="typeof fetch">
+  Override the global `fetch` implementation. Useful in test environments or runtimes where you need a custom fetch.
+</ParamField>
+
+---
+
+### `outbox(adapter, opts?)`
+
+Returns an `OutboxDelivery<Tx>` configuration object. In outbox mode, `send()` only writes rows to storage — a worker delivers them asynchronously and durably.
+
+```ts
+import { outbox } from "@webhooks/sdk";
+
+const delivery = outbox(myAdapter, {
+  maxAttempts: 20,
+  backoffMs: (attempts) => Math.min(3_600_000, 30_000 * 2 ** (attempts - 1)),
+});
+```
+
+<ParamField path="adapter" type="OutboxAdapter<Tx>" required>
+  Your storage adapter. Must implement `insert`, `claim`, `complete`, `retry`, and `dead`. See the [`OutboxAdapter`](#outboxadaptertx) interface below.
+</ParamField>
+
+<ParamField path="opts.maxAttempts" type="number" default="20">
+  Maximum delivery attempts before a row is moved to the dead-letter state. Must be a positive integer.
+</ParamField>
+
+<ParamField path="opts.backoffMs" type="(attempts: number) => number">
+  Delay before the next worker attempt. The default is exponential backoff capped at 1 hour: `Math.min(3_600_000, 30_000 * 2 ** (attempts - 1))`.
+</ParamField>
+
+---
+
+### `ok(value)`
+
+Constructs a successful `Result`. Use this when building custom adapters or tests that need to return `Result` values.
+
+```ts
+import { ok } from "@webhooks/sdk";
+
+const result = ok({ eventId: "evt_123", enqueued: 2 });
+// { ok: true, value: { eventId: "evt_123", enqueued: 2 } }
+```
+
+---
+
+### `err(error)`
+
+Constructs a failed `Result`. The `error` field is a string by default but can be any type `E`.
+
+```ts
+import { err } from "@webhooks/sdk";
+
+const result = err("something went wrong");
+// { ok: false, error: "something went wrong" }
+```
+
+---
+
+### `isValidSecret(secret)`
+
+Returns `true` if the secret is a valid signing secret. For secrets starting with `whsec_`, the suffix must be non-empty, valid standard base64. For all other secrets, any non-empty string is valid.
+
+```ts
+import { isValidSecret } from "@webhooks/sdk";
+
+isValidSecret("whsec_dGVzdA==");  // true
+isValidSecret("my-raw-secret");    // true
+isValidSecret("whsec_");           // false — empty base64
+isValidSecret("");                 // false — empty string
+```
+
+---
+
+### `signPayload(secret, eventId, timestampSec, payload)`
+
+Computes the Standard Webhooks HMAC-SHA256 signature over `{eventId}.{timestampSec}.{payload}` and returns it as a `v1,<base64>` string. You typically do not call this directly — `send()` signs automatically.
+
+```ts
+import { signPayload } from "@webhooks/sdk";
+
+const sig = await signPayload(
+  "whsec_dGVzdA==",
+  "evt_abc123",
+  Math.floor(Date.now() / 1000),
+  '{"event":"invoice.paid","subject":"acct_1","data":{}}'
+);
+// "v1,<base64-signature>"
+```
+
+---
+
+### `memoryAdapter()`
+
+Returns an in-memory `MemoryAdapter` suitable for tests and local development. Do not use it in production — all state is lost when the process exits, and it is not safe for multiple concurrent workers.
+
+```ts
+import { memoryAdapter } from "@webhooks/sdk";
+
+const adapter = memoryAdapter();
+// adapter.rows — inspect pending/delivered/dead rows in tests
+// adapter.lastTx — the last transaction value passed to insert()
+```
+
+---
+
+## Interfaces
+
+### `DirectWebhooks<E, S>`
+
+Returned by `webhooks()` when `delivery` is `direct()` or omitted. Has a single method.
+
+```ts
+interface DirectWebhooks<E extends EventMap, S extends SubjectMode = undefined> {
+  send<K extends keyof E & string>(
+    input: SendInput<E, K, S>,
+  ): Promise<Result<DirectSendReport>>;
+}
+```
+
+`send()` resolves to `Result<DirectSendReport>`. A failed result (`ok: false`) means the event could not be prepared — validation failure, unknown event, missing secret, etc. HTTP delivery outcomes (including partial failures per subscriber) are inside `result.value.deliveries` on success.
+
+---
+
+### `OutboxWebhooks<E, Tx, S>`
+
+Returned by `webhooks()` when `delivery` is `outbox(...)`. Has three members.
+
+```ts
+interface OutboxWebhooks<E extends EventMap, Tx, S extends SubjectMode = undefined> {
+  send<K extends keyof E & string>(
+    input: SendInput<E, K, S>,
+  ): Promise<Result<EnqueueReport>>;
+
+  with(tx: Tx): {
+    send<K extends keyof E & string>(
+      input: SendInput<E, K, S>,
+    ): Promise<Result<EnqueueReport>>;
+  };
+
+  worker(opts?: WorkerOpts): OutboxWorker;
+}
+```
+
+- **`send(input)`** — Inserts outbox rows using the adapter's own connection (outside any transaction).
+- **`with(tx).send(input)`** — Inserts outbox rows inside your transaction. The outbox row commits or rolls back atomically with your business data.
+- **`worker(opts?)`** — Creates an `OutboxWorker` that polls and delivers rows. You can run the worker in the same process or a separate worker dyno.
+
+---
+
+### `OutboxWorker`
+
+Drives the outbox delivery loop. Returned by `OutboxWebhooks.worker()`.
+
+```ts
+interface OutboxWorker {
+  start(): void;
+  stop(): Promise<void>;
+  tick(): Promise<TickReport>;
+}
+```
+
+- **`start()`** — Begins polling. Safe to call multiple times; subsequent calls are no-ops while already running.
+- **`stop()`** — Stops the loop and waits for any in-flight tick to complete before resolving.
+- **`tick()`** — Runs one claim-and-deliver pass manually. Use this to drive delivery from an external cron scheduler instead of the internal polling loop.
+
+---
+
+### `WebhooksConfig<E>`
+
+The configuration object passed to `webhooks()`.
+
+```ts
+interface WebhooksConfig<E extends EventMap> {
+  events: E;
+  subscribers: Subscriber[] | SubscriberResolver;
+  signing?: { secret: string };
+  subject?: "optional";
+}
+```
+
+---
+
+### `DirectDelivery`
+
+```ts
+interface DirectDelivery {
+  kind: "direct";
+  maxAttempts: number;
+  backoffMs: (attempts: number) => number;
+  timeoutMs: number;
+  fetchImpl: typeof fetch;
+}
+```
+
+---
+
+### `OutboxDelivery<Tx>`
+
+```ts
+interface OutboxDelivery<Tx = unknown> {
+  kind: "outbox";
+  adapter: OutboxAdapter<Tx>;
+  maxAttempts: number;
+  backoffMs: (attempts: number) => number;
+}
+```
+
+---
+
+### `DeliveryOutcome`
+
+One entry per subscriber in `DirectSendReport.deliveries`. Describes what happened during a direct delivery.
+
+```ts
+interface DeliveryOutcome {
+  url: string;
+  delivered: boolean;
+  attempts: number;
+  status?: number;
+  error?: string;
+}
+```
+
+<ResponseField name="url" type="string">
+  The subscriber endpoint that was targeted.
+</ResponseField>
+
+<ResponseField name="delivered" type="boolean">
+  `true` if any attempt received a 2xx response.
+</ResponseField>
+
+<ResponseField name="attempts" type="number">
+  How many HTTP attempts were made before the result was determined.
+</ResponseField>
+
+<ResponseField name="status" type="number">
+  The HTTP status code of the successful (2xx) response. Present only when `delivered` is `true`.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  The error message from the last failed attempt. Present only when `delivered` is `false`.
+</ResponseField>
+
+---
+
+### `DirectSendReport`
+
+Returned inside `Result` from `DirectWebhooks.send()` on success.
+
+```ts
+interface DirectSendReport {
+  eventId: string;
+  deliveries: DeliveryOutcome[];
+}
+```
+
+<ResponseField name="eventId" type="string">
+  The generated event ID (format: `evt_<uuid>`). Stable across all delivery attempts for this event.
+</ResponseField>
+
+<ResponseField name="deliveries" type="DeliveryOutcome[]">
+  One entry per subscriber that was targeted. Check each entry's `delivered` field for per-subscriber outcomes.
+</ResponseField>
+
+---
+
+### `EnqueueReport`
+
+Returned inside `Result` from `OutboxWebhooks.send()` on success.
+
+```ts
+interface EnqueueReport {
+  eventId: string;
+  enqueued: number;
+}
+```
+
+<ResponseField name="eventId" type="string">
+  The generated event ID (format: `evt_<uuid>`).
+</ResponseField>
+
+<ResponseField name="enqueued" type="number">
+  The number of outbox rows inserted — one per matched subscriber.
+</ResponseField>
+
+---
+
+### `TickReport`
+
+Returned by `OutboxWorker.tick()`. Summarises what happened during one poll pass.
+
+```ts
+interface TickReport {
+  claimed: number;
+  delivered: number;
+  retried: number;
+  dead: number;
+}
+```
+
+<ResponseField name="claimed" type="number">
+  Number of rows fetched from the adapter's `claim()` call.
+</ResponseField>
+
+<ResponseField name="delivered" type="number">
+  Number of rows that received a 2xx response and were marked complete.
+</ResponseField>
+
+<ResponseField name="retried" type="number">
+  Number of rows where delivery failed but `attempts` is still below `maxAttempts`. Their `nextAttemptAt` has been pushed back.
+</ResponseField>
+
+<ResponseField name="dead" type="number">
+  Number of rows that have exhausted all attempts and been moved to dead-letter state.
+</ResponseField>
+
+---
+
+### `WorkerOpts`
+
+Optional configuration passed to `OutboxWebhooks.worker(opts?)`.
+
+<ParamField path="pollIntervalMs" type="number" default="1000">
+  Milliseconds between the end of one tick and the start of the next.
+</ParamField>
+
+<ParamField path="batch" type="number" default="100">
+  Maximum number of rows claimed per tick.
+</ParamField>
+
+<ParamField path="timeoutMs" type="number" default="10000">
+  Per-request HTTP timeout in milliseconds.
+</ParamField>
+
+<ParamField path="fetchImpl" type="typeof fetch">
+  Override the global `fetch` used by the worker. Defaults to the global `fetch`.
+</ParamField>
+
+<ParamField path="hooks" type="WorkerHooks">
+  Optional lifecycle callbacks. See `WorkerHooks` below.
+</ParamField>
+
+---
+
+### `WorkerHooks`
+
+Lifecycle callbacks you can attach to the worker for observability, logging, or alerting. All hooks are optional. A throwing hook is caught silently — it does not stop the loop or affect delivery.
+
+```ts
+interface WorkerHooks {
+  onDelivered?(row: OutboxRow): void;
+  onRetry?(row: OutboxRow, error: string): void;
+  onDead?(row: OutboxRow, error: string): void;
+  onError?(error: unknown): void;
+}
+```
+
+<ParamField path="onDelivered" type="(row: OutboxRow) => void">
+  Called after a row is successfully delivered and marked complete.
+</ParamField>
+
+<ParamField path="onRetry" type="(row: OutboxRow, error: string) => void">
+  Called after a delivery attempt fails and the row is scheduled for retry.
+</ParamField>
+
+<ParamField path="onDead" type="(row: OutboxRow, error: string) => void">
+  Called after a row has exhausted all attempts and been marked dead.
+</ParamField>
+
+<ParamField path="onError" type="(error: unknown) => void">
+  Called for row-level or loop-level failures such as an adapter throwing during a tick. The loop continues polling after this callback.
+</ParamField>
+
+---
+
+### `OutboxAdapter<Tx>`
+
+The storage contract your adapter must implement. All five properties use function-type notation (not method notation) to avoid TypeScript's bivariant method checking, which would otherwise allow an `OutboxAdapter<PgTx>` to silently widen to `OutboxAdapter<unknown>`.
+
+```ts
+interface OutboxAdapter<Tx = unknown> {
+  insert: (rows: OutboxRow[], tx?: Tx) => Promise<void>;
+  claim: (limit: number, now: Date) => Promise<OutboxRow[]>;
+  complete: (rowId: string) => Promise<void>;
+  retry: (
+    rowId: string,
+    attempts: number,
+    nextAttemptAt: Date,
+    lastError: string,
+  ) => Promise<void>;
+  dead: (rowId: string, attempts: number, lastError: string) => Promise<void>;
+}
+```
+
+<ParamField path="insert" type="(rows: OutboxRow[], tx?: Tx) => Promise<void>" required>
+  Insert one or more outbox rows. `tx` is the transaction value passed to `wh.with(tx).send()` — pass it through to your query builder so the insert participates in the caller's transaction.
+</ParamField>
+
+<ParamField path="claim" type="(limit: number, now: Date) => Promise<OutboxRow[]>" required>
+  Return up to `limit` pending rows whose `nextAttemptAt <= now`. With multiple concurrent workers you must atomically mark claimed rows (e.g. a `claimed_at` timestamp column with `FOR UPDATE SKIP LOCKED`) to prevent double-delivery.
+</ParamField>
+
+<ParamField path="complete" type="(rowId: string) => Promise<void>" required>
+  Mark a row as successfully delivered (status `"delivered"`).
+</ParamField>
+
+<ParamField path="retry" type="(rowId: string, attempts: number, nextAttemptAt: Date, lastError: string) => Promise<void>" required>
+  Update a row's `attempts` count, schedule its next attempt, and record the last error string.
+</ParamField>
+
+<ParamField path="dead" type="(rowId: string, attempts: number, lastError: string) => Promise<void>" required>
+  Mark a row as dead-letter (status `"dead"`) after exhausting all attempts.
+</ParamField>
+
+---
+
+### `OutboxRow`
+
+The shape of a row passed to and returned from adapter methods.
+
+```ts
+interface OutboxRow {
+  id: string;
+  eventId: string;
+  eventType: string;
+  subject: string | null;
+  body: string;
+  url: string;
+  secret: string | null;
+  attempts: number;
+  nextAttemptAt: Date;
+  status: "pending" | "delivered" | "dead";
+  lastError: string | null;
+  createdAt: Date;
+}
+```
+
+<Expandable title="Field descriptions">
+
+<ResponseField name="id" type="string">
+  Row-level unique ID (format: `obx_<uuid>`). One row per subscriber per event.
+</ResponseField>
+
+<ResponseField name="eventId" type="string">
+  The event ID shared across all rows for the same logical event (format: `evt_<uuid>`). Stable across every retry — use it for consumer-side deduplication.
+</ResponseField>
+
+<ResponseField name="eventType" type="string">
+  The event key from your `EventMap`, e.g. `"invoice.paid"`.
+</ResponseField>
+
+<ResponseField name="subject" type="string | null">
+  The domain entity this event concerns. `null` when `subject: "optional"` is configured and no subject was provided.
+</ResponseField>
+
+<ResponseField name="body" type="string">
+  Pre-serialized, pre-validated JSON body. Signed and sent verbatim at delivery time — do not modify it.
+</ResponseField>
+
+<ResponseField name="url" type="string">
+  The subscriber endpoint URL.
+</ResponseField>
+
+<ResponseField name="secret" type="string | null">
+  The per-row signing secret. Falls back to the worker's `defaultSecret` at delivery time when `null`.
+</ResponseField>
+
+<ResponseField name="attempts" type="number">
+  Number of delivery attempts made so far.
+</ResponseField>
+
+<ResponseField name="nextAttemptAt" type="Date">
+  When the row becomes eligible to be claimed again.
+</ResponseField>
+
+<ResponseField name="status" type='"pending" | "delivered" | "dead"'>
+  Current lifecycle state of the row.
+</ResponseField>
+
+<ResponseField name="lastError" type="string | null">
+  Error message from the most recent failed attempt, or `null` if no attempt has been made.
+</ResponseField>
+
+<ResponseField name="createdAt" type="Date">
+  Timestamp when the row was inserted.
+</ResponseField>
+
+</Expandable>
+
+---
+
+### `MemoryAdapter`
+
+Extends `OutboxAdapter<unknown>` with two inspection properties for tests.
+
+```ts
+interface MemoryAdapter extends OutboxAdapter<unknown> {
+  rows: OutboxRow[];
+  lastTx: unknown;
+}
+```
+
+<ResponseField name="rows" type="OutboxRow[]">
+  The live array of all rows — inspect it in tests to assert on enqueued, delivered, or dead rows.
+</ResponseField>
+
+<ResponseField name="lastTx" type="unknown">
+  The last transaction value passed to `insert()`. Useful in tests to assert that `wh.with(tx).send()` passed the right transaction.
+</ResponseField>
+
+---
+
+## Types
+
+### `SendInput<E, K, S>`
+
+The argument shape for `send()`. `event` narrows `data` — changing the `event` key changes the accepted `data` type at compile time.
+
+```ts
+type SendInput<
+  E extends EventMap,
+  K extends keyof E & string,
+  S extends SubjectMode,
+> = {
+  event: K;
+  data: StandardSchemaV1.InferInput<E[K]>;
+} & (S extends "optional" ? { subject?: string } : { subject: string });
+```
+
+When `subject` is `"optional"` in the config, the `subject` field is optional. Otherwise it is required and the TypeScript compiler will reject a call that omits it.
+
+---
+
+### `Result<T, E>`
+
+A discriminated union used as the return type for `send()` and as a utility for your own code.
+
+```ts
+type Result<T, E = string> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+```
+
+Check `result.ok` before accessing `result.value` or `result.error`.
+
+---
+
+### `EventMap`
+
+```ts
+type EventMap = Record<string, StandardSchemaV1>;
+```
+
+A plain object mapping event-type strings to Standard Schema validators.
+
+---
+
+### `EventUnion<E>`
+
+Produces the discriminated union of all events in an `EventMap` as they appear on the wire (after the JSON round-trip). Export this from your sender package so consumers can pass it to `verifier.verify<Events>(req)` with a type-only import — no runtime dependency on the sender package required.
+
+```ts
+type EventUnion<E extends EventMap> = {
+  [K in keyof E]: {
+    event: K & string;
+    subject: string | null;
+    data: Jsonify<StandardSchemaV1.InferOutput<E[K]>>;
+  };
+}[keyof E];
+```
+
+---
+
+### `Jsonify<T>`
+
+Transforms a TypeScript type into its wire representation after `JSON.stringify` + `JSON.parse`. `Date` becomes `string`, `bigint`/`Function`/`symbol` become `never`. Used internally for `EventUnion` and useful when typing consumer-side payloads.
+
+---
+
+### `Subscriber`
+
+```ts
+interface Subscriber {
+  url: string;
+  secret?: string;
+}
+```
+
+<ParamField path="url" type="string" required>
+  The HTTPS endpoint that will receive the webhook POST.
+</ParamField>
+
+<ParamField path="secret" type="string">
+  Per-subscriber signing secret. Overrides `signing.secret` from `WebhooksConfig`. Falls back to the top-level secret when omitted.
+</ParamField>
+
+---
+
+### `SubscriberResolver`
+
+```ts
+type SubscriberResolver = (event: {
+  event: string;
+  subject: string | null;
+  data: unknown;
+}) => Subscriber[] | Promise<Subscriber[]>;
+```
+
+A function — typically a database query — that returns the list of subscribers for a given event. The `subject` argument makes multi-tenant scoping easy: filter by `subject` to return only the subscribers for the relevant account or user.
+
+---
+
+### `StandardSchemaV1`
+
+A vendored subset of the [Standard Schema v1 spec](https://github.com/standard-schema/standard-schema). Any library that implements this interface (Zod v3.24+, Valibot, ArkType) works as a schema for your `EventMap`.

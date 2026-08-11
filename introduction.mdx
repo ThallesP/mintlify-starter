@@ -1,0 +1,68 @@
+---
+title: "Standard Webhooks SDK: Typed Webhooks for TypeScript"
+sidebarTitle: "Introduction"
+description: "Learn what the Standard Webhooks SDK is, how its two packages split producer and consumer responsibilities, and what wire format it uses."
+---
+
+The Standard Webhooks SDK gives you a fully type-safe way to send and verify webhooks in TypeScript. Rather than hand-rolling HMAC signing, header parsing, and retry logic yourself, you get two focused packages — one for the services that **produce** events and one for the services that **consume** them — both built on the [Standard Webhooks](https://www.standardwebhooks.com/) wire format so every signed payload is interoperable.
+
+## The two packages
+
+Each package owns exactly one side of the webhook exchange. Install only what your service needs.
+
+<CardGroup cols={2}>
+  <Card
+    title="@webhooks/sdk"
+    icon="paper-plane"
+    href="https://github.com/ThallesP/webhooks/tree/main/packages/sdk"
+  >
+    For **producers**. Define typed event schemas, resolve subscribers, and deliver signed webhooks — inline with `direct()` or durably with the transactional `outbox()`.
+  </Card>
+  <Card
+    title="@webhooks/verify"
+    icon="shield-check"
+    href="https://github.com/ThallesP/webhooks/tree/main/packages/verify"
+  >
+    For **consumers**. Verify incoming webhook signatures with zero runtime dependencies. Distribute it to your users as the client-side verification SDK.
+  </Card>
+</CardGroup>
+
+## Key features
+
+- **End-to-end type safety.** Event schemas (Zod, Valibot, ArkType — any [Standard Schema](https://standardschema.dev/) library) narrow `data` at the call site. A mismatched payload is a compile error, not a runtime surprise.
+- **Subject-scoped delivery.** Every `send()` carries a `subject` that ties the event to a domain entity (a user id, account id, or row id). The subject flows into the signed body and is available to the subscriber resolver, so multi-tenant lookups require no payload digging.
+- **Direct and outbox delivery modes.** `direct()` delivers inline with exponential-backoff retries; `outbox()` persists events to your own database table so they survive crashes and commit atomically with your business data.
+- **Result-based error handling.** `send()` and `verifyPayload()` never throw on expected failures — they return `{ ok: true, value }` or `{ ok: false, error }` / `{ ok: false, reason }` so you handle failures where they occur.
+- **Zero-dependency verification.** `@webhooks/verify` uses only the Web Crypto API (`crypto.subtle`). There is no dependency tree to audit.
+- **Svix header compatibility.** The verifier accepts both `webhook-*` and `svix-*` header names, so you can verify payloads from svix-backed senders without any configuration change.
+
+## Platform support
+
+`@webhooks/verify` runs anywhere the Web Crypto API is available. `@webhooks/sdk` delivers webhooks with the global `fetch`, so it shares the same reach.
+
+| Runtime | Supported |
+|---|---|
+| Node.js 20+ | ✅ |
+| Bun | ✅ |
+| Deno | ✅ |
+| Cloudflare Workers | ✅ |
+| Other edge runtimes | ✅ |
+
+<Note>
+  Node 18 ships without a global `WebCrypto` object. Use Node 20 or later, or polyfill `globalThis.crypto` before constructing a verifier.
+</Note>
+
+## Wire format
+
+Both packages implement the [Standard Webhooks](https://www.standardwebhooks.com/) wire format:
+
+- **Signing algorithm:** HMAC-SHA256 over the concatenated string `{id}.{timestamp}.{body}` (raw bytes, not re-encoded text).
+- **Headers:** `webhook-id` (stable across every retry of the same event), `webhook-timestamp` (Unix seconds), and `webhook-signature` (space-separated `v1,<base64>` candidates).
+- **Svix compatibility:** `@webhooks/verify` also reads `svix-id`, `svix-timestamp`, and `svix-signature` as fallbacks, so a single verifier handles both Standard Webhooks and Svix-backed senders.
+- **Secret format:** Secrets prefixed with `whsec_` are base64-decoded before use (the Standard Webhooks convention). Unprefixed secrets are treated as raw UTF-8 bytes. A `whsec_` secret with empty or malformed base64 is rejected at construction time.
+
+The `webhook-id` header is **identical across every retry attempt** for the same logical event. This is by design — it is your deduplication key.
+
+<Note>
+  Delivery is **at-least-once**. A sender marks an event delivered only after receiving your `2xx` response. A crash or database hiccup between your response and that write means the same event may arrive more than once. Deduplicate on `webhook-id` — unique-insert the id and skip on conflict — to make processing effectively exactly-once. Event ordering is also not guaranteed.
+</Note>

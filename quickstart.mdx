@@ -1,47 +1,218 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quickstart: Send and Verify Webhooks in TypeScript"
+sidebarTitle: "Quickstart"
+description: "Install both packages, define typed event schemas, send your first signed webhook, and verify an incoming webhook in a fetch-style or Express handler."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you through sending your first signed webhook with `@webhooks/sdk` and verifying an incoming one with `@webhooks/verify`. By the end you will have a working producer and a working consumer that both speak the Standard Webhooks wire format.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+  <Step title="Install @webhooks/sdk">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+    Add the producer package to your project with your preferred package manager.
 
-    ```bash
-    your-cli start
+    <CodeGroup>
+
+    ```bash npm
+    npm install @webhooks/sdk
     ```
+
+    ```bash yarn
+    yarn add @webhooks/sdk
+    ```
+
+    ```bash pnpm
+    pnpm add @webhooks/sdk
+    ```
+
+    ```bash bun
+    bun add @webhooks/sdk
+    ```
+
+    </CodeGroup>
+
+    <Note>
+      `@webhooks/sdk` requires Node.js 20 or later. On Bun, Deno, and Cloudflare Workers it works out of the box.
+    </Note>
+
   </Step>
+
+  <Step title="Define your event schemas">
+
+    You describe every event your service can emit as a map of event-name strings to [Standard Schema](https://standardschema.dev/)-compatible validators. The example below uses **Zod v4**, but Valibot and ArkType work identically — the SDK accepts any library that implements the `StandardSchemaV1` interface.
+
+    ```ts
+    import { z } from "zod";
+
+    const events = {
+      "invoice.paid": z.object({ invoiceId: z.string(), amountCents: z.number() }),
+      "user.created": z.object({ userId: z.string(), email: z.string() }),
+    };
+    ```
+
+    These schemas do two jobs at once: they validate the `data` you pass to `send()` at runtime, and they narrow the `data` type at compile time so the TypeScript compiler catches mismatches before you ship.
+
+    <Tip>
+      Export an `EventUnion` type from your sender package so consumers can import it with a **type-only** import and get fully-typed payloads on the receiving end — no runtime dependency on your schemas required.
+
+      ```ts
+      // sender package
+      import type { EventUnion } from "@webhooks/sdk";
+      export type Events = EventUnion<typeof events>;
+      ```
+    </Tip>
+
+  </Step>
+
+  <Step title="Create a webhooks instance">
+
+    Pass your event map, a subscriber resolver, and a signing secret to `webhooks()`. The `direct()` delivery mode delivers inline from `send()` and retries with exponential backoff up to `maxAttempts` times.
+
+    ```ts
+    import { webhooks, direct } from "@webhooks/sdk";
+
+    const wh = webhooks({
+      events,
+      // Usually a DB lookup — resolves which subscribers receive this event.
+      // A static Subscriber[] also works for single-endpoint or internal setups.
+      subscribers: async ({ event, subject }) =>
+        db
+          .select({ url: subs.url, secret: subs.secret })
+          .from(subs)
+          .where(and(eq(subs.subject, subject), arrayContains(subs.events, [event]))),
+      signing: { secret: process.env.WEBHOOK_SECRET! }, // per-subscriber `secret` overrides this
+      delivery: direct({ maxAttempts: 5 }),              // default when omitted
+    });
+    ```
+
+    The `subscribers` resolver receives the `event` name and the `subject` you supply at send time, so you can scope your query to the exact tenant or entity without parsing the payload.
+
+    <Warning>
+      Never log or expose `WEBHOOK_SECRET`. A `whsec_`-prefixed secret is base64-decoded before use; an unprefixed secret is treated as raw UTF-8. The SDK rejects an empty or malformed secret at construction time so a misconfigured deploy fails loudly at boot.
+    </Warning>
+
+  </Step>
+
+  <Step title="Send your first webhook">
+
+    Call `wh.send()` with the event name, a subject, and the typed payload. The `event` field narrows `data` at the type level — passing the wrong shape is a compile error.
+
+    ```ts
+    const result = await wh.send({
+      event: "invoice.paid",          // narrows data — correlated at the type level
+      subject: "acct_42",             // what the event is about (user / account / row id)
+      data: { invoiceId: "inv_1", amountCents: 4200 },
+    });
+
+    if (!result.ok) {
+      console.error(result.error);
+      // Covered: schema validation, unknown event type, non-JSON-serializable
+      // payload, subscriber resolver failure, missing signing secret, missing subject.
+    } else {
+      // Per-subscriber HTTP outcomes are inside result.value.deliveries.
+      console.log(result.value.deliveries);
+    }
+    ```
+
+    `send()` returns a `Result` — it never throws on expected failures. Check `result.ok` before reading `result.value`; if it is `false`, `result.error` is a human-readable string describing what went wrong.
+
+    <Tip>
+      `subject` is **required by default**. If your setup genuinely has no concept of a subject (single-tenant internals, for example), pass `subject: "optional"` to the `webhooks()` config to make it optional at the call site.
+    </Tip>
+
+  </Step>
+
+  <Step title="Install @webhooks/verify and verify incoming webhooks">
+
+    On the consumer side, install `@webhooks/verify`. It has **zero runtime dependencies** and uses only the Web Crypto API.
+
+    <CodeGroup>
+
+    ```bash npm
+    npm install @webhooks/verify
+    ```
+
+    ```bash yarn
+    yarn add @webhooks/verify
+    ```
+
+    ```bash pnpm
+    pnpm add @webhooks/verify
+    ```
+
+    ```bash bun
+    bun add @webhooks/verify
+    ```
+
+    </CodeGroup>
+
+    Create a single verifier instance (it pre-imports the HMAC key once) and call `verify()` in your request handler. The `createVerifier()` call throws immediately if the secret is empty or malformed, so a broken deployment fails at startup rather than silently accepting requests.
+
+    **Fetch-style frameworks** (Next.js App Router, Hono, Remix, Cloudflare Workers):
+
+    ```ts
+    import { createVerifier } from "@webhooks/verify";
+
+    const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+    export async function POST(req: Request) {
+      const result = await verifier.verify(req);
+      if (!result.ok) return new Response(result.reason, { status: 400 });
+
+      result.payload; // parsed JSON body — typed as unknown by default
+      return new Response(null, { status: 204 });
+    }
+    ```
+
+    **Express** (and other Node frameworks that expose the raw body):
+
+    ```ts
+    import { createVerifier } from "@webhooks/verify";
+
+    const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+    // MUST use express.raw — parsed JSON breaks signatures.
+    app.post("/hook", express.raw({ type: "application/json" }), async (req, res) => {
+      const result = await verifier.verifyPayload(req.body, req.headers);
+      if (!result.ok) return res.status(400).end();
+      res.status(204).end();
+    });
+    ```
+
+    <Warning>
+      In Express (and any framework that gives you a pre-parsed body), use `verifyPayload()` with the **raw** `Buffer` or `Uint8Array`. The HMAC is computed over the exact bytes received — re-serialising parsed JSON changes whitespace and key order, invalidating the signature.
+    </Warning>
+
+    When verification fails, `result.reason` is one of these codes — never an exception:
+
+    | Reason code | Meaning |
+    |---|---|
+    | `missing_headers` | One or more of `webhook-id`, `webhook-timestamp`, `webhook-signature` is absent |
+    | `invalid_id` | The `webhook-id` contains a `.` (makes the signed string ambiguous) |
+    | `invalid_timestamp` | The timestamp header is not an integer |
+    | `timestamp_out_of_tolerance` | The timestamp is more than ±300 s from now (replay protection) |
+    | `invalid_signature` | None of the up-to-8 signature candidates matched |
+    | `invalid_secret` | The HMAC key could not be imported |
+    | `unreadable_body` | The request body could not be read (fetch-style path) |
+    | `invalid_json` | Signature valid but body is not valid JSON |
+
+    <Tip>
+      You can pass a type parameter to `verify()` or `verifyPayload()` to get a typed `result.payload`. Combine it with your sender's exported `EventUnion` for end-to-end type safety with no runtime dependency on the sender's code.
+
+      ```ts
+      import type { Events } from "acme-sdk";
+
+      const result = await verifier.verify<Events>(req);
+      if (result.ok) {
+        switch (result.payload.event) {
+          case "invoice.paid":
+            result.payload.data.amountCents; // number ✅
+        }
+      }
+      ```
+    </Tip>
+
+  </Step>
+
 </Steps>
-
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>

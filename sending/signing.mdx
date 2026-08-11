@@ -1,0 +1,147 @@
+---
+title: "Webhook Signing with HMAC-SHA256 (Standard Webhooks)"
+sidebarTitle: "Signing"
+description: "Understand how @webhooks/sdk signs every request with HMAC-SHA256, which HTTP headers it sets, how secrets are decoded, and how to validate secrets early."
+---
+
+Every outgoing webhook request is signed automatically — you never call a signing function yourself. The SDK computes an HMAC-SHA256 signature over a canonical string derived from the event ID, a Unix timestamp, and the raw request body, then attaches the result in an HTTP header. Receivers can verify the signature with `@webhooks/verify` (or any Standard Webhooks-compatible library) to confirm that the request came from you and was not tampered with in transit.
+
+## The Standard Webhooks signature
+
+The SDK implements the [Standard Webhooks](https://www.standardwebhooks.com/) signing specification. For each delivery attempt the SDK:
+
+<Steps>
+  <Step title="Build the signed string">
+    Concatenates the event ID, a Unix timestamp in seconds, and the raw JSON body using `.` as a separator:
+
+    ```
+    {webhook-id}.{webhook-timestamp}.{body}
+    ```
+  </Step>
+  <Step title="Compute HMAC-SHA256">
+    Computes `HMAC-SHA256(key, signed_string)` using the Web Crypto API (`crypto.subtle`). The key is derived from your signing secret (see [secret formats](#secret-formats) below).
+  </Step>
+  <Step title="Encode and emit">
+    Base64-encodes the raw HMAC output and prefixes it with `v1,`, producing a value like `v1,g0hM9SsE+OTPJTGezF43VA==`. This is placed in the `webhook-signature` header.
+  </Step>
+</Steps>
+
+The timestamp used for signing is taken fresh at the moment of each HTTP attempt — not at the time `send()` was called. This matters for retries: an endpoint typically rejects signatures more than 5 minutes old, and a retry that waits out a backoff sleep would have a stale timestamp if the SDK did not refresh it.
+
+## HTTP headers
+
+Every signed request includes three headers:
+
+| Header | Value | Notes |
+|---|---|---|
+| `webhook-id` | `evt_<uuid>` | Stable across all retries and all subscribers for a given `send()` call. Use this to deduplicate. |
+| `webhook-timestamp` | Unix seconds as a decimal string | Fresh per attempt. |
+| `webhook-signature` | `v1,<base64>` | HMAC-SHA256 as described above. |
+
+Receivers reconstruct the signed string from these headers and verify it against their copy of the secret. The `webhook-id` being stable across retries is by design — it is what lets consumers implement exactly-once processing by deduplicating on this value.
+
+## Configuring your signing secret
+
+Set a default secret at the top level of `webhooks()`:
+
+```typescript
+const wh = webhooks({
+  events,
+  subscribers,
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+});
+```
+
+Each entry in your `subscribers` list (or returned from your resolver) can carry its own `secret` that overrides the top-level one for that specific endpoint. This lets different customers receive events signed with different secrets:
+
+```typescript
+const wh = webhooks({
+  events,
+  subscribers: async ({ event, subject }) => [
+    {
+      url: "https://customer-a.example.com/hook",
+      secret: "whsec_YWJjZGVmZ2hpamtsbW5vcA==",  // per-subscriber
+    },
+    {
+      url: "https://customer-b.example.com/hook",
+      // no secret here — falls back to signing.secret
+    },
+  ],
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+});
+```
+
+If a subscriber has no `secret` and no top-level `signing.secret` is configured, `send()` returns `{ ok: false, error: "no signing secret for subscriber ..." }` without making any HTTP requests.
+
+## Secret formats
+
+The SDK accepts two secret formats:
+
+**`whsec_<base64>`** — Standard Webhooks format. The prefix is stripped and the remainder is decoded from base64 before use as the HMAC key. This is the recommended format for sharing secrets with customers, because it is the same format `@webhooks/verify` and other Standard Webhooks libraries expect.
+
+```typescript
+// Standard Webhooks format — base64-decoded before signing
+const secret = "whsec_YWJjZGVmZ2hpamtsbW5vcA==";
+```
+
+**Plain UTF-8 string** — anything that does not start with `whsec_` is treated as raw UTF-8 bytes and used directly as the HMAC key. This works but will not interoperate with libraries that always base64-decode.
+
+```typescript
+// Plain string — used as raw UTF-8 bytes
+const secret = "my-plain-secret-at-least-32-chars";
+```
+
+<Warning>
+  A secret with the `whsec_` prefix must contain valid, non-empty base64 after the prefix. If the base64 portion is empty or malformed, `send()` returns `{ ok: false, error: "invalid signing secret ..." }` without making any HTTP requests. The SDK never falls back to using the literal `whsec_` string as the key — doing so would sign with a publicly known, guessable key. Validate your secrets at startup (see `isValidSecret` below) so a misconfigured deploy fails immediately.
+</Warning>
+
+## Checking secrets up front with `isValidSecret`
+
+The SDK exports `isValidSecret(secret: string): boolean` so you can validate secrets at startup or when a customer registers an endpoint — before any `send()` calls.
+
+```typescript
+import { isValidSecret } from "@webhooks/sdk";
+
+// At application startup
+const secret = process.env.WEBHOOK_SECRET!;
+if (!isValidSecret(secret)) {
+  throw new Error(`WEBHOOK_SECRET is invalid: "${secret}"`);
+}
+
+// When a customer saves their endpoint configuration
+function saveEndpoint(url: string, secret: string) {
+  if (!isValidSecret(secret)) {
+    throw new UserError("The signing secret is invalid. Use a whsec_<base64> or plain string.");
+  }
+  // ... persist to database
+}
+```
+
+`isValidSecret` returns `false` for:
+- The empty string
+- A `whsec_`-prefixed string with empty or non-base64 content after the prefix
+
+It returns `true` for any non-empty plain string or a well-formed `whsec_<base64>` secret.
+
+## Signature verification on the consumer side
+
+Your customers verify incoming requests using `@webhooks/verify`. That package is zero-dependency and runs anywhere with Web Crypto (Node 20+, Bun, Deno, Cloudflare Workers, and other edge runtimes).
+
+```typescript
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+// fetch-style handler (Next.js App Router, Hono, Cloudflare Workers, etc.)
+export async function POST(req: Request) {
+  const result = await verifier.verify(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  // result.payload.subject — authenticated, lives inside the signed body
+  // result.payload.event — the event type string
+  // result.payload.data  — the event payload
+  return new Response(null, { status: 204 });
+}
+```
+
+See the `@webhooks/verify` documentation for the full API, including per-request tolerance overrides and the `verifyPayload` method for Express (which requires the raw body buffer).

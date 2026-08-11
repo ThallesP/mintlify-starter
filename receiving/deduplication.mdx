@@ -1,0 +1,119 @@
+---
+title: "Handling Duplicate Webhooks: At-Least-Once Delivery"
+sidebarTitle: "Deduplication"
+description: "Webhooks are delivered at-least-once. Learn how to use webhook-id as an idempotency key to achieve exactly-once processing."
+---
+
+Webhook delivery is **at-least-once**, not exactly-once. Every major webhook platform — Stripe, Shopify, GitHub — documents this explicitly: if your server returns a 2xx response, the sender treats the delivery as successful; but if anything goes wrong between the sender recording that success and your handler finishing its work, the sender will retry. The result is that your handler may receive the same logical event more than once, and you need to be prepared for it.
+
+## Why duplicates happen
+
+The race condition is structural, not a bug in the sender. Here is the sequence:
+
+<Steps>
+  <Step title="Sender fires the request">
+    The sender sends the signed HTTP POST to your endpoint.
+  </Step>
+  <Step title="Your handler processes the event">
+    Your code verifies the signature, writes to your database, sends an email, charges a card — whatever the event requires.
+  </Step>
+  <Step title="Your server returns 2xx">
+    The HTTP response travels back to the sender.
+  </Step>
+  <Step title="Sender marks the event delivered">
+    Only after receiving the 2xx does the sender update its own state to "delivered".
+  </Step>
+</Steps>
+
+If your server crashes, the database write times out, or the network drops between steps 3 and 4, the sender never sees the 2xx. From its perspective, the delivery failed, and it schedules a retry. Your handler then processes the same event a second time — even though the first attempt may have already committed side effects.
+
+## The `webhook-id` is your idempotency key
+
+The `webhook-id` header is assigned once when the event is first created and stays **identical across every retry** of that event. Two deliveries with the same `webhook-id` represent the same logical event, regardless of how many times they have been attempted or when they arrived.
+
+After a successful `verify()` call, `result.id` carries this stable identifier:
+
+```typescript
+const result = await verifier.verify(req);
+if (!result.ok) return new Response(result.reason, { status: 400 });
+
+const eventId = result.id; // stable across all retries of this event
+```
+
+## Deduplicate with a unique-insert
+
+The most robust deduplication strategy is a unique constraint on `event_id` in your database, combined with a skip-on-conflict clause. The insert is atomic: if the row already exists, the query does nothing and you skip processing; if it doesn't, you proceed. Exactly one thread or process ever crosses from "not processed" to "processing".
+
+```sql
+-- One-time schema migration
+CREATE TABLE processed_webhook_events (
+  event_id   TEXT PRIMARY KEY,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Then, inside your handler:
+
+```sql
+-- Attempt to claim the event — returns 0 rows if already processed
+INSERT INTO processed_webhook_events (event_id)
+VALUES ($1)
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id;
+```
+
+In application code the pattern looks like this:
+
+```typescript
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+export async function POST(req: Request) {
+  const result = await verifier.verify(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  // Try to insert the event ID — skip if already seen
+  const inserted = await db.execute(
+    `INSERT INTO processed_webhook_events (event_id)
+     VALUES ($1)
+     ON CONFLICT (event_id) DO NOTHING
+     RETURNING event_id`,
+    [result.id]
+  );
+
+  if (inserted.rowCount === 0) {
+    // Already processed — acknowledge without re-running side effects
+    return new Response(null, { status: 204 });
+  }
+
+  // Safe to process — first time we've seen this event
+  await handleEvent(result.payload);
+  return new Response(null, { status: 204 });
+}
+```
+
+<Tip>
+  If your business logic and the deduplication insert both touch the same database, wrap them in a single transaction. That way a crash after `handleEvent` but before the transaction commits means the insert is also rolled back — the next retry will re-insert successfully and re-run your handler, rather than silently skip processing.
+</Tip>
+
+## Ordering is not guaranteed
+
+Retries and parallel delivery windows mean you cannot assume that event N arrives before event N+1. If you model state as a sequence of events (an account balance, a document revision), design your handler to be order-independent:
+
+- Use **idempotent state transitions** — "set balance to X" rather than "add Y to balance".
+- Include a **version or timestamp** in the event payload and discard events that are older than what you have already applied.
+- Prefer **last-write-wins** semantics where possible.
+
+<Note>
+  Stripe, Shopify, and GitHub all document at-least-once delivery and recommend the same deduplication approach. If you already handle duplicates for one of those platforms, the same infrastructure works here — the only difference is that the idempotency key lives in `webhook-id` (or `result.id` after verification) rather than a platform-specific header.
+</Note>
+
+## Summary
+
+| Concept | Detail |
+|---|---|
+| Delivery guarantee | At-least-once — your handler may run more than once per event |
+| Idempotency key | `result.id` from `VerifyResult` — the stable `webhook-id` value |
+| Deduplication strategy | Unique-insert on `event_id`, skip on conflict |
+| Ordering | Not guaranteed — design handlers to be order-independent |

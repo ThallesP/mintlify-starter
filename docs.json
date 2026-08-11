@@ -1,72 +1,73 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
-  "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "name": "Standard Webhooks",
+  "theme": "luma",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/6f7581d4-d240-48d3-b5ad-57755ae14406.svg",
+    "dark": "https://media.brand.dev/6f7581d4-d240-48d3-b5ad-57755ae14406.svg"
+  },
+  "favicon": "https://media.brand.dev/4c277e08-c6eb-47af-bb26-779dc3ec3cdf.png",
+  "colors": {
+    "primary": "#242424",
+    "light": "#a3a3a3",
+    "dark": "#d6d6d6"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ThallesP/webhooks"
     }
   },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Sending Webhooks",
+            "pages": [
+              "sending/overview",
+              "sending/direct-delivery",
+              "sending/outbox-delivery",
+              "sending/subjects",
+              "sending/signing"
+            ]
+          },
+          {
+            "group": "Receiving Webhooks",
+            "pages": [
+              "receiving/overview",
+              "receiving/verifying",
+              "receiving/typed-events",
+              "receiving/deduplication"
+            ]
+          },
+          {
+            "group": "Outbox Adapter",
+            "pages": [
+              "adapter/interface",
+              "adapter/postgres",
+              "adapter/memory"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/sdk-api",
+              "reference/verify-api",
+              "reference/error-codes",
+              "reference/secret-format"
+            ]
+          }
+        ]
+      }
     ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
   }
 }

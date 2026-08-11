@@ -1,0 +1,222 @@
+---
+title: "Transactional Outbox Delivery for Reliable Webhooks"
+sidebarTitle: "Outbox Delivery"
+description: "Use outbox() delivery to write webhook rows atomically inside your database transaction, then deliver them durably with a background worker."
+---
+
+Outbox delivery separates the act of *recording* an event from the act of *delivering* it. When you call `wh.send()` in outbox mode, the SDK inserts one row per subscriber into durable storage (your database) rather than making any HTTP requests. A separate worker process claims those rows and delivers them. Because the insert can happen inside the same database transaction as your business data, the event is guaranteed to be recorded if and only if your transaction commits — and the worker will keep retrying until the endpoint acknowledges it, surviving crashes along the way.
+
+## Configuring outbox delivery
+
+Pass `outbox(adapter, opts?)` to the `delivery` option of `webhooks()`. The first argument is an adapter that bridges the SDK to your storage layer; the second is optional configuration.
+
+```typescript
+import { webhooks, outbox } from "@webhooks/sdk";
+import { myAdapter } from "./my-outbox-adapter";
+
+const wh = webhooks({
+  events,
+  subscribers,
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+  delivery: outbox(myAdapter, {
+    maxAttempts: 20,   // default
+    backoffMs: (attempts) => Math.min(3_600_000, 30_000 * 2 ** (attempts - 1)),
+  }),
+});
+```
+
+<ParamField body="adapter" type="OutboxAdapter<Tx>" required>
+  Your storage adapter. See the adapter interface below. A `memoryAdapter()` ships for tests and local development.
+</ParamField>
+
+<ParamField body="maxAttempts" type="number" default="20">
+  Maximum total delivery attempts before a row is moved to the dead-letter state. Must be a positive integer.
+</ParamField>
+
+<ParamField body="backoffMs" type="(attempts: number) => number" default="Math.min(3_600_000, 30_000 * 2 ** (attempts - 1))">
+  Delay in milliseconds before the next worker attempt. The argument is the number of failed attempts so far (starts at 1 after the first failure). The default starts at 30 s and doubles each time, capped at 1 hour.
+</ParamField>
+
+## Writing events inside a transaction
+
+The key advantage of outbox delivery is the atomic `with(tx).send()` pattern. Pass your ORM transaction handle to `wh.with(tx)` and the outbox row commits together with your business data in a single database transaction.
+
+```typescript
+import { db } from "./db";
+import { invoices } from "./schema";
+
+await db.transaction(async (tx) => {
+  // Insert business data
+  const [row] = await tx.insert(invoices).values(invoiceData).returning();
+
+  // Insert the outbox row in the same transaction
+  await wh.with(tx).send({
+    event: "invoice.paid",
+    subject: `acct_${row.accountId}`,
+    data: { invoiceId: row.id, amountCents: row.total },
+  });
+});
+```
+
+If the transaction rolls back for any reason, the outbox row is rolled back with it — no phantom events. If the transaction commits, the worker will find the row and deliver it.
+
+You can also call `wh.send()` without `with(tx)` to enqueue outside a transaction using the adapter's own connection.
+
+<Note>
+  `wh.with(tx)` and `wh.worker()` are only present on the return type of `webhooks()` when `delivery: outbox(...)` is configured. Calling either method with `direct()` (or no delivery option at all) is a **compile-time error**, not a runtime one. The type system ensures you cannot accidentally omit the worker or depend on one that does not exist.
+</Note>
+
+## Running the worker
+
+Call `wh.worker(opts?)` to create a worker instance, then call `worker.start()` to begin polling.
+
+```typescript
+const worker = wh.worker({
+  pollIntervalMs: 1_000,  // poll every second (default)
+  batch: 100,             // claim up to 100 rows per tick (default)
+  timeoutMs: 10_000,      // per-attempt HTTP timeout in ms (default)
+  fetchImpl: fetch,       // custom fetch for testing
+  hooks: {
+    onDelivered: (row) => console.log("delivered", row.eventId),
+    onRetry:     (row, error) => console.warn("retrying", row.eventId, error),
+    onDead:      (row, error) => console.error("dead", row.eventId, error),
+    onError:     (err) => console.error("worker error", err),
+  },
+});
+
+worker.start();
+
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  await worker.stop(); // waits for all in-flight ticks to finish
+  process.exit(0);
+});
+```
+
+### `WorkerOpts`
+
+<ParamField body="pollIntervalMs" type="number" default="1000">
+  Milliseconds between the end of one tick and the start of the next. The worker does not overlap ticks — the timer starts after `tick()` resolves.
+</ParamField>
+
+<ParamField body="batch" type="number" default="100">
+  Maximum number of outbox rows claimed per `tick()` call.
+</ParamField>
+
+<ParamField body="timeoutMs" type="number" default="10000">
+  Per-attempt HTTP timeout in milliseconds, using `AbortSignal.timeout`.
+</ParamField>
+
+<ParamField body="fetchImpl" type="typeof fetch" default="globalThis.fetch">
+  Custom `fetch` implementation. Useful for injecting test doubles without patching globals.
+</ParamField>
+
+<ParamField body="hooks" type="WorkerHooks">
+  Optional lifecycle callbacks. A throwing hook never kills the worker loop — the SDK catches and suppresses hook errors.
+</ParamField>
+
+### `WorkerHooks`
+
+<ParamField body="onDelivered" type="(row: OutboxRow) => void">
+  Called after a row is successfully delivered and marked complete.
+</ParamField>
+
+<ParamField body="onRetry" type="(row: OutboxRow, error: string) => void">
+  Called when a delivery attempt fails but the row still has attempts remaining. Useful for alerting on repeated failures.
+</ParamField>
+
+<ParamField body="onDead" type="(row: OutboxRow, error: string) => void">
+  Called when a row exhausts all attempts and is moved to the dead-letter state. This is your signal to alert and investigate.
+</ParamField>
+
+<ParamField body="onError" type="(error: unknown) => void">
+  Called for row-level or loop-level errors (adapter failure, throwing hooks, etc.). The worker keeps polling after these.
+</ParamField>
+
+### Worker control methods
+
+<ParamField body="start()" type="() => void">
+  Begins the polling loop. Safe to call multiple times — subsequent calls while already running are no-ops.
+</ParamField>
+
+<ParamField body="stop()" type="() => Promise<void>">
+  Stops scheduling new ticks and waits for any in-flight tick to finish before resolving. Use this for graceful shutdown.
+</ParamField>
+
+<ParamField body="tick()" type="() => Promise<TickReport>">
+  Runs one claim-and-deliver pass manually. You can drive this from a cron job instead of using the built-in polling loop.
+</ParamField>
+
+### Cron-driven delivery
+
+If your deployment model favors cron jobs over long-running processes, skip `worker.start()` and call `worker.tick()` directly.
+
+```typescript
+// In your cron handler (Vercel Cron, Cloudflare Workers, etc.)
+const worker = wh.worker({ batch: 200, timeoutMs: 8_000 });
+const report = await worker.tick();
+console.log(`tick: ${report.delivered} delivered, ${report.retried} retried, ${report.dead} dead`);
+```
+
+<Tip>
+  Running the worker in a separate dyno or container isolates delivery load from your request-serving processes and lets you scale them independently. If you are on a platform with dedicated worker processes (Heroku, Fly.io, Railway), point a `worker` process at a module that calls `worker.start()` and nothing else.
+</Tip>
+
+## Return types
+
+### `EnqueueReport`
+
+The value inside `result.value` when `wh.send()` succeeds in outbox mode.
+
+<ParamField body="eventId" type="string">
+  Stable identifier for this event (`evt_<uuid>`). Shared across all outbox rows created for this `send()` call and used as the `webhook-id` header on delivery.
+</ParamField>
+
+<ParamField body="enqueued" type="number">
+  Number of outbox rows inserted — one per resolved subscriber. Zero means no subscribers matched; the event is unsubscribed and nothing will be delivered.
+</ParamField>
+
+### `TickReport`
+
+Returned by `worker.tick()`.
+
+<ParamField body="claimed" type="number">
+  Rows fetched from storage in this tick.
+</ParamField>
+
+<ParamField body="delivered" type="number">
+  Rows that received a 2xx response and were marked complete.
+</ParamField>
+
+<ParamField body="retried" type="number">
+  Rows that failed but still have attempts remaining, rescheduled for a future tick.
+</ParamField>
+
+<ParamField body="dead" type="number">
+  Rows that exhausted all attempts and were moved to the dead-letter state.
+</ParamField>
+
+## Outbox adapter interface
+
+The SDK delegates all storage operations to an adapter you provide. Five methods are required:
+
+```typescript
+interface OutboxAdapter<Tx = unknown> {
+  /** Insert new rows, optionally inside a caller-supplied transaction. */
+  insert(rows: OutboxRow[], tx?: Tx): Promise<void>;
+
+  /** Claim rows that are pending and due now (next_attempt_at <= now). */
+  claim(limit: number, now: Date): Promise<OutboxRow[]>;
+
+  /** Mark a row delivered. */
+  complete(rowId: string): Promise<void>;
+
+  /** Schedule a retry at nextAttemptAt after a failed attempt. */
+  retry(rowId: string, attempts: number, nextAttemptAt: Date, lastError: string): Promise<void>;
+
+  /** Move a row to dead-letter state after exhausting all attempts. */
+  dead(rowId: string, attempts: number, lastError: string): Promise<void>;
+}
+```
+
+A `memoryAdapter()` is exported for tests and local development. For production, implement this interface against your Postgres table. See the README for a reference schema and a `claim` query that uses `SELECT ... FOR UPDATE SKIP LOCKED` with a lease timestamp to prevent double-delivery with multiple concurrent workers.

@@ -1,0 +1,193 @@
+---
+title: "Verify Webhook Signatures in Node.js and Edge Runtimes"
+sidebarTitle: "Verifying"
+description: "Step-by-step guide to verifying Standard Webhooks HMAC-SHA256 signatures in any JavaScript runtime using @webhooks/verify."
+---
+
+Verifying a webhook signature proves that the request was signed by whoever holds your shared secret and that it was sent recently — protecting you from forged payloads and replay attacks. `@webhooks/verify` implements the [Standard Webhooks](https://www.standardwebhooks.com/) HMAC-SHA256 scheme: a MAC over `{id}.{timestamp}.{body}`, with the result sent in the `webhook-signature` header.
+
+## Creating a verifier
+
+You create a verifier once — at module load time, in a singleton, or in your framework's startup hook — and reuse it for every incoming request. The constructor imports the HMAC key eagerly, so the expensive cryptographic setup happens once rather than on every request.
+
+```typescript
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+```
+
+### Options
+
+`createVerifier` accepts an optional second argument:
+
+```typescript
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!, {
+  toleranceSec: 300, // default — reject requests older than ±300 seconds
+});
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `toleranceSec` | `number` | `300` | Maximum age (in seconds) of a valid request. Requests whose `webhook-timestamp` differs from wall-clock time by more than this value are rejected with `timestamp_out_of_tolerance`. |
+
+### Constructor errors
+
+Misconfiguration throws immediately at construction time, not silently at request time. This means a broken deployment fails loudly at boot before it can accept replays or verify against a trivially-guessable key.
+
+The constructor throws a `RangeError` if:
+
+- The secret is an empty string.
+- The secret starts with `whsec_` but the base64 payload is empty or not valid base64.
+- `toleranceSec` is `NaN`, `Infinity`, or negative — a `NaN` tolerance would silently accept every replay.
+
+```typescript
+// ✅ Valid — raw UTF-8 secret
+createVerifier("my-secret-value");
+
+// ✅ Valid — Standard Webhooks base64-prefixed secret
+createVerifier("whsec_dGhpcyBpcyBhIHRlc3Q=");
+
+// ❌ Throws RangeError at construction
+createVerifier("");
+createVerifier("whsec_!!not-base64!!");
+createVerifier("my-secret", { toleranceSec: -1 });
+```
+
+## Verifying requests
+
+<Tabs>
+  <Tab title="Fetch-style (Next.js / Hono / Workers)">
+
+Use `verifier.verify(request)` when your framework hands you a standard Fetch `Request` object. The method reads the body as raw bytes — preserving the exact bytes that were signed — and checks the headers in one step.
+
+```typescript
+import { createVerifier } from "@webhooks/verify";
+
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+// Next.js App Router
+export async function POST(req: Request) {
+  const result = await verifier.verify(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  result.payload; // parsed JSON body
+  return new Response(null, { status: 204 });
+}
+```
+
+The same pattern works identically in Hono and Cloudflare Workers:
+
+```typescript
+// Hono
+app.post("/webhook", async (c) => {
+  const result = await verifier.verify(c.req.raw);
+  if (!result.ok) return c.text(result.reason, 400);
+
+  console.log(result.payload);
+  return c.body(null, 204);
+});
+
+// Cloudflare Workers
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const result = await verifier.verify(request);
+    if (!result.ok) return new Response(result.reason, { status: 400 });
+
+    return new Response(null, { status: 204 });
+  },
+};
+```
+
+  </Tab>
+  <Tab title="Express / Fastify">
+
+Use `verifier.verifyPayload(payload, headers)` when the framework gives you a pre-buffered body. You pass the raw body bytes (or string) and the request headers as separate arguments.
+
+<Warning>
+  You **must** pass the RAW body — the original bytes before any parsing. If you pass `JSON.stringify(req.body)` (a re-serialised object), the signature check will fail because whitespace, key order, and Unicode escaping may differ from what was originally signed. Use `express.raw()` or `fastify.addContentTypeParser` to get the raw buffer.
+</Warning>
+
+```typescript
+import express from "express";
+import { createVerifier } from "@webhooks/verify";
+
+const app = express();
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+// express.raw() buffers the body as a Buffer (Uint8Array subclass) — pass it straight through
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const result = await verifier.verifyPayload(req.body, req.headers);
+    if (!result.ok) return res.status(400).end();
+
+    console.log(result.payload);
+    res.status(204).end();
+  }
+);
+```
+
+```typescript
+// Fastify
+import Fastify from "fastify";
+import { createVerifier } from "@webhooks/verify";
+
+const app = Fastify();
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+app.addContentTypeParser(
+  "application/json",
+  { parseAs: "buffer" },
+  (_req, body, done) => done(null, body)
+);
+
+app.post("/webhook", async (req, reply) => {
+  const result = await verifier.verifyPayload(
+    req.body as Buffer,
+    req.headers
+  );
+  if (!result.ok) return reply.status(400).send();
+
+  console.log(result.payload);
+  return reply.status(204).send();
+});
+```
+
+  </Tab>
+</Tabs>
+
+## The `VerifyResult<T>` type
+
+Both `verify` and `verifyPayload` return a `Promise<VerifyResult<T>>`. The type is a discriminated union — check the `ok` field first:
+
+```typescript
+export type VerifyResult<T> =
+  | { ok: true; id: string; timestamp: Date; payload: T }
+  | { ok: false; reason: VerifyFailure };
+```
+
+When `ok` is `true`:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `string` | The stable event ID from `webhook-id`. Use this for deduplication. |
+| `timestamp` | `Date` | The event timestamp as a JavaScript `Date` object. |
+| `payload` | `T` | The parsed JSON body, typed as `T` (defaults to `unknown`). |
+
+When `ok` is `false`:
+
+| `reason` | Cause |
+|---|---|
+| `missing_headers` | One or more of `webhook-id`, `webhook-timestamp`, `webhook-signature` is absent. |
+| `invalid_id` | The `webhook-id` contains a `.` character, which makes the signed string ambiguous. |
+| `invalid_timestamp` | The `webhook-timestamp` header is not a valid integer. |
+| `timestamp_out_of_tolerance` | The timestamp differs from wall-clock time by more than `toleranceSec`. |
+| `invalid_signature` | None of the provided signature candidates matched. |
+| `invalid_secret` | The HMAC key could not be imported (secret format problem detected at verify time). |
+| `unreadable_body` | The request body stream could not be read (`verify()` only). |
+| `invalid_json` | The body bytes are not valid JSON. |
+
+## Security note: signature candidates
+
+The `webhook-signature` header can contain multiple space-separated `v1,<base64>` candidates — this supports key rotation, where the sender signs with both the old and new secret simultaneously during a rollover window. To prevent denial-of-service attacks driven by an inflated header, `@webhooks/verify` tries **at most 8 candidates** per request and stops as soon as one matches.

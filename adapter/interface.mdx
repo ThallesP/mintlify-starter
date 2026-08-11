@@ -1,0 +1,117 @@
+---
+title: "OutboxAdapter Interface: Bring Your Own Storage"
+sidebarTitle: "Interface"
+description: "Implement the five-method OutboxAdapter interface to connect the webhook outbox to any database or storage backend you already use."
+---
+
+The `OutboxAdapter` interface is the contract between the Standard Webhooks SDK and your storage layer. When you configure `delivery: outbox(myAdapter)`, every call to `wh.send()` writes rows through `insert`, and the background worker drives delivery by calling `claim`, `complete`, `retry`, and `dead`. You implement all five methods once, wired to whatever database your application already runs, and the SDK handles retry scheduling, backoff, and dead-lettering on top.
+
+## The five methods
+
+<ParamField body="insert" type="(rows: OutboxRow[], tx?: Tx) => Promise<void>" required>
+  Persists one or more outbox rows, optionally inside a caller-supplied transaction. When you call `wh.with(tx).send(...)`, the transaction handle flows through to `insert` as the second argument, so the outbox row commits atomically with your own business data. If `tx` is `undefined`, your implementation should use its own connection.
+</ParamField>
+
+<ParamField body="claim" type="(limit: number, now: Date) => Promise<OutboxRow[]>" required>
+  Returns up to `limit` rows whose `status` is `'pending'` and whose `nextAttemptAt` is on or before `now`. The worker calls this at the start of every tick and delivers everything returned. See the leasing requirement below — a naive lock-based implementation will cause double-delivery under concurrent workers.
+</ParamField>
+
+<ParamField body="complete" type="(rowId: string) => Promise<void>" required>
+  Marks the row with `rowId` as `'delivered'`. The worker calls this after receiving a `2xx` response from the subscriber endpoint. Once complete, the row is never claimed again.
+</ParamField>
+
+<ParamField body="retry" type="(rowId: string, attempts: number, nextAttemptAt: Date, lastError: string) => Promise<void>" required>
+  Schedules a future retry for a row that failed delivery but has not yet exhausted `maxAttempts`. The SDK computes the next attempt time using the configured `backoffMs` function and passes it as `nextAttemptAt`. Store `attempts` and `lastError` alongside it so you can monitor failure trends without querying logs.
+</ParamField>
+
+<ParamField body="dead" type="(rowId: string, attempts: number, lastError: string) => Promise<void>" required>
+  Moves the row to the dead-letter state (`status: 'dead'`). The worker calls this either when `attempts` reaches `maxAttempts`, or immediately when a row has no signing secret. Dead rows are never re-claimed by the worker — you replay them manually after investigating the failure.
+</ParamField>
+
+## The `OutboxRow` shape
+
+Every row your adapter stores and returns must conform to this interface, defined in `outbox.ts`:
+
+```typescript
+export interface OutboxRow {
+  id: string;
+  eventId: string;
+  eventType: string;
+  /** What the event is about (user, account, row — caller's vocabulary). */
+  subject: string | null;
+  /** Pre-serialized JSON body — signed and sent verbatim at delivery time. */
+  body: string;
+  url: string;
+  secret: string | null;
+  attempts: number;
+  nextAttemptAt: Date;
+  status: "pending" | "delivered" | "dead";
+  lastError: string | null;
+  createdAt: Date;
+}
+```
+
+Key fields to understand:
+
+- **`id`** — unique row identifier, distinct from `eventId`. One `send()` call can produce multiple rows (one per subscriber), all sharing the same `eventId` but each with their own `id`.
+- **`eventId`** — the stable identifier sent in the `webhook-id` header on every delivery attempt for this event. Consumers dedupe on this value.
+- **`eventType`** — the event name from your schema (e.g. `"invoice.paid"`). Useful for dead-letter filtering.
+- **`subject`** — the domain entity the event is about, in your vocabulary (`"acct_42"`, `"user_123"`). Nullable when the webhooks instance is configured with `subject: "optional"`. Index this column — it enables queries like "all failed deliveries for account 42".
+- **`body`** — the pre-serialized JSON payload. The worker signs and sends this string verbatim at delivery time; never re-serialize it.
+- **`secret`** — the per-subscriber signing secret, or `null` if the row should fall back to the adapter's `defaultSecret`. If both are `null`, the worker dead-letters the row immediately.
+- **`status`** — one of `"pending"`, `"delivered"`, or `"dead"`. Your `claim` implementation should only return `"pending"` rows.
+- **`attempts`** — how many delivery attempts have been made so far. Starts at `0`; the worker increments it before calling `retry` or `dead`.
+- **`nextAttemptAt`** — when the row is eligible to be claimed again. Set to `now` on insert; updated to a future time on retry.
+- **`lastError`** — the most recent delivery error string, for observability. `null` on newly inserted rows.
+- **`createdAt`** — insertion timestamp.
+
+## The generic `Tx` parameter
+
+`OutboxAdapter<Tx>` is generic so your implementation can carry a concrete transaction type:
+
+```typescript
+interface OutboxAdapter<Tx = unknown> {
+  insert: (rows: OutboxRow[], tx?: Tx) => Promise<void>;
+  // ...
+}
+```
+
+The `Tx` type parameter represents whatever your database library uses as its transaction handle — for example, Drizzle's `PgTransaction`, Prisma's `Prisma.TransactionClient`, or a raw `pg.PoolClient`. When you pass your adapter to `outbox(myAdapter)`, TypeScript infers `Tx` from the adapter and enforces that `wh.with(tx)` is called with a matching type. Calling `wh.with(tx)` against an adapter typed as `OutboxAdapter<PgTransaction>` with a Prisma client is a compile error, not a runtime surprise.
+
+The interface deliberately uses property-style function signatures (`insert: (…) => …`) instead of method syntax (`insert(…): …`). This is intentional: method signatures are bivariant in TypeScript, which would allow an `OutboxAdapter<PgTransaction>` to silently widen to `OutboxAdapter<unknown>` and accept arbitrary values where only a Postgres transaction belongs.
+
+## Claim leasing: why a plain lock is not enough
+
+<Warning>
+  `claim` must set a **lease** on the rows it returns — not merely acquire a database lock. A plain `SELECT ... FOR UPDATE SKIP LOCKED` releases the row-level lock the moment `claim()` returns and the transaction commits. At that point, before the worker has finished making the HTTP request, another worker can claim the exact same rows and deliver them a second time.
+
+  The correct pattern is to **write a timestamp into the row inside the same statement that selects it**, so the lease outlives the transaction. Any row with a stale lease is treated as unclaimed and becomes eligible again after a timeout, covering worker crashes.
+</Warning>
+
+The leasing pattern for Postgres looks like this:
+
+```sql
+UPDATE webhook_outbox SET claimed_at = now()
+WHERE id IN (
+  SELECT id FROM webhook_outbox
+  WHERE status = 'pending' AND next_attempt_at <= $1
+    AND (claimed_at IS NULL OR claimed_at < now() - INTERVAL '2 minutes')
+  ORDER BY next_attempt_at
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+The `FOR UPDATE SKIP LOCKED` in the subquery ensures two concurrent workers never race on the same candidate rows. The outer `UPDATE` writes `claimed_at` inside the same atomic statement — the lock is held until that write commits. After the transaction, the row carries the timestamp. Any worker that crashes mid-delivery leaves a stale `claimed_at`, and the `claimed_at < now() - INTERVAL '2 minutes'` condition makes those rows reclaimable after the timeout expires.
+
+## Stale-claimed-at recovery
+
+The recovery window (two minutes in the example above) is a tradeoff:
+
+- **Too short**: a slow delivery or a briefly overloaded worker gets its rows re-claimed while it is still mid-flight, causing duplicate delivery.
+- **Too long**: a crashed worker's rows sit unclaimed for longer than necessary.
+
+A two-minute window is reasonable for most HTTP endpoints. Adjust it to be safely longer than your `timeoutMs` setting (default 10 seconds) plus any expected tail latency. If you configure `timeoutMs: 30_000`, a window of at least five minutes gives you comfortable headroom.
+
+When a recovered row is re-delivered, the subscriber receives the same `webhook-id` as the original attempt. Well-behaved consumers dedupe on `webhook-id`, so the duplicate is harmless — but your adapter implementation is responsible for ensuring the lease pattern is correct so duplicates remain rare rather than routine.

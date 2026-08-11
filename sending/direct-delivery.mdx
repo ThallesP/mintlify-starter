@@ -1,0 +1,149 @@
+---
+title: "Direct Webhook Delivery with In-Process Retries"
+sidebarTitle: "Direct Delivery"
+description: "Configure direct() delivery to send webhooks inline from send(), with exponential backoff retries and per-subscriber outcome reporting."
+---
+
+Direct delivery sends your webhook immediately when you call `wh.send()`. The HTTP request goes out in the same process, retries happen with exponential backoff, and the final outcome for every subscriber is returned in the same promise. This is the simplest setup — no separate worker process, no database table, no extra infrastructure — and it works well for low-to-moderate volumes where losing an in-flight retry on a process restart is acceptable.
+
+## Configuring direct delivery
+
+Pass `direct(opts?)` to the `delivery` option of `webhooks()`. All options are optional; the defaults are chosen to be reasonable out of the box.
+
+```typescript
+import { webhooks, direct } from "@webhooks/sdk";
+
+const wh = webhooks({
+  events,
+  subscribers,
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+  delivery: direct({
+    maxAttempts: 5,         // retry up to 5 times total (default)
+    timeoutMs: 10_000,      // 10 s per attempt (default)
+    backoffMs: (attempts) => Math.min(30_000, 500 * 2 ** (attempts - 1)),
+    fetchImpl: fetch,       // swap for a custom fetch in tests
+  }),
+});
+```
+
+When you omit `delivery` entirely, `webhooks()` defaults to `direct()` with all defaults — so the explicit `delivery: direct()` in the example above is equivalent to omitting it.
+
+<ParamField body="maxAttempts" type="number" default="5">
+  Total number of HTTP attempts per subscriber. Must be a positive integer; `webhooks()` throws at construction if this is `0`, fractional, or `NaN`.
+</ParamField>
+
+<ParamField body="backoffMs" type="(attempts: number) => number" default="Math.min(30_000, 500 * 2 ** (attempts - 1))">
+  Function that returns the delay in milliseconds before the next attempt. The argument is the number of failed attempts so far (starts at 1 after the first failure). The default produces delays of 500 ms, 1 s, 2 s, 4 s, …, capped at 30 s.
+</ParamField>
+
+<ParamField body="timeoutMs" type="number" default="10000">
+  Per-attempt timeout in milliseconds. The SDK uses `AbortSignal.timeout(timeoutMs)` — the request is aborted and counted as a failed attempt if the endpoint does not respond in time.
+</ParamField>
+
+<ParamField body="fetchImpl" type="typeof fetch" default="globalThis.fetch">
+  The `fetch` implementation to use. Override this in tests to inject a mock without patching globals.
+</ParamField>
+
+## How retries work
+
+The SDK runs all subscribers in parallel via `Promise.all`, but retries each subscriber sequentially so backoff delays are per-endpoint, not shared.
+
+<Steps>
+  <Step title="First attempt">
+    The SDK signs the payload with a fresh timestamp and makes one POST request. If the endpoint returns a 2xx status, the delivery succeeds immediately.
+  </Step>
+  <Step title="Backoff sleep">
+    On any non-2xx response, timeout, or network error, the SDK sleeps for `backoffMs(failedAttempts)` milliseconds. With the default formula, the first retry waits 500 ms, the second 1 s, the third 2 s, and so on — capped at 30 s.
+  </Step>
+  <Step title="Subsequent attempts">
+    Each retry is signed with a fresh timestamp so the signature is always within the receiver's replay-tolerance window, regardless of how long the backoff took.
+  </Step>
+  <Step title="Exhaustion">
+    After `maxAttempts` total tries without a 2xx, the SDK records `delivered: false` for that subscriber and moves on. All other subscribers are unaffected.
+  </Step>
+</Steps>
+
+<Warning>
+  Retries are in-memory only. If your process crashes or restarts while a `send()` call is waiting out a backoff sleep, those pending retries are lost. If you need guaranteed delivery across restarts, use [outbox delivery](/sending/outbox-delivery) instead.
+</Warning>
+
+## Redirect behavior
+
+The SDK sets `redirect: "manual"` on every fetch call. A 3xx response is treated as a failed delivery attempt — the redirect is never followed.
+
+This is intentional: following a redirect would turn your signed POST into a bodyless GET (the browser redirect spec drops the body on 301/302), and a malicious endpoint could redirect to an attacker-controlled URL to receive your signed payload. If a subscriber endpoint has moved, update the URL in your subscriber table rather than relying on redirects.
+
+## Return types
+
+### `DeliveryOutcome`
+
+One entry in `result.value.deliveries` per subscriber. Inspect these to understand what happened at the HTTP level for each endpoint.
+
+<ParamField body="url" type="string">
+  The subscriber URL that was attempted.
+</ParamField>
+
+<ParamField body="delivered" type="boolean">
+  `true` if any attempt received a 2xx response; `false` if all attempts were exhausted without success.
+</ParamField>
+
+<ParamField body="attempts" type="number">
+  Total number of HTTP attempts made. On success this is the attempt number that finally returned 2xx. On failure this equals `maxAttempts`.
+</ParamField>
+
+<ParamField body="status" type="number | undefined">
+  HTTP status code from the last successful response (only present when `delivered` is `true`).
+</ParamField>
+
+<ParamField body="error" type="string | undefined">
+  Description of the last failure (only present when `delivered` is `false`). May be a network error message or an HTTP status like `"endpoint responded 503"`.
+</ParamField>
+
+### `DirectSendReport`
+
+The value inside `result.value` when `result.ok` is `true`.
+
+<ParamField body="eventId" type="string">
+  A stable identifier for this event in the format `evt_<uuid>`. The same `eventId` is used as the `webhook-id` header on every attempt and every subscriber — your consumers can deduplicate on it.
+</ParamField>
+
+<ParamField body="deliveries" type="DeliveryOutcome[]">
+  One entry per subscriber resolved for this event. An empty array means the subscriber resolver returned no matching subscribers (not an error — the event is simply unsubscribed).
+</ParamField>
+
+## Complete example
+
+```typescript
+import { webhooks, direct } from "@webhooks/sdk";
+import { z } from "zod";
+
+const wh = webhooks({
+  events: {
+    "order.shipped": z.object({ orderId: z.string(), trackingCode: z.string() }),
+  },
+  subscribers: async ({ subject }) =>
+    db.query.webhookSubscribers.findMany({ where: eq(table.accountId, subject) }),
+  signing: { secret: process.env.WEBHOOK_SECRET! },
+  delivery: direct({ maxAttempts: 3, timeoutMs: 5_000 }),
+});
+
+const result = await wh.send({
+  event: "order.shipped",
+  subject: "acct_99",
+  data: { orderId: "ord_7", trackingCode: "1Z999AA1" },
+});
+
+if (!result.ok) {
+  // Fatal: schema error, unknown event, resolver failure, missing secret, etc.
+  throw new Error(`webhook send failed: ${result.error}`);
+}
+
+for (const delivery of result.value.deliveries) {
+  if (!delivery.delivered) {
+    console.warn(
+      `Failed to deliver ${result.value.eventId} to ${delivery.url} ` +
+      `after ${delivery.attempts} attempt(s): ${delivery.error}`,
+    );
+  }
+}
+```

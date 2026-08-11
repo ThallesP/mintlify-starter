@@ -1,0 +1,97 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Standard Webhooks",
+  "projectDescription": "Two TypeScript packages for producing and consuming type-safe, Standard Webhooks-compliant webhooks: @webhooks/sdk for senders (direct or transactional-outbox delivery) and @webhooks/verify for receivers (zero-dependency HMAC-SHA256 verification).",
+  "theme": "luma",
+  "primaryColor": "#242424",
+  "lightColor": "#a3a3a3",
+  "darkColor": "#d6d6d6",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Sending Webhooks",
+            "pages": [
+              "sending/overview",
+              "sending/direct-delivery",
+              "sending/outbox-delivery",
+              "sending/subjects",
+              "sending/signing"
+            ]
+          },
+          {
+            "group": "Receiving Webhooks",
+            "pages": [
+              "receiving/overview",
+              "receiving/verifying",
+              "receiving/typed-events",
+              "receiving/deduplication"
+            ]
+          },
+          {
+            "group": "Outbox Adapter",
+            "pages": [
+              "adapter/interface",
+              "adapter/postgres",
+              "adapter/memory"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/sdk-api",
+              "reference/verify-api",
+              "reference/error-codes",
+              "reference/secret-format"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Type-safe event definitions using any Standard Schema library (Zod, Valibot, ArkType)",
+    "Direct in-process delivery with automatic retries and exponential backoff",
+    "Transactional outbox delivery — rows commit atomically with your database transaction",
+    "Background worker for polling and delivering outbox rows",
+    "Zero-dependency signature verification using WebCrypto",
+    "Standard Webhooks wire format (HMAC-SHA256) — compatible with Svix senders",
+    "Subject scoping for multi-tenant event routing",
+    "Typed event unions for consumers with no runtime dependency on the sender",
+    "Failure reason codes (never thrown exceptions) for predictable error handling",
+    "Runs on Node 20+, Bun, Deno, Cloudflare Workers, and edge runtimes"
+  ],
+  "publicApiSurface": [
+    "webhooks(config): DirectWebhooks | OutboxWebhooks",
+    "direct(opts?): DirectDelivery",
+    "outbox(adapter, opts?): OutboxDelivery",
+    "wh.send(input): Promise<Result<DirectSendReport | EnqueueReport>>",
+    "wh.with(tx).send(input): Promise<Result<EnqueueReport>>",
+    "wh.worker(opts?): OutboxWorker",
+    "worker.start(): void",
+    "worker.stop(): Promise<void>",
+    "worker.tick(): Promise<TickReport>",
+    "createVerifier(secret, opts?): Verifier",
+    "verifier.verify(request): Promise<VerifyResult>",
+    "verifier.verifyPayload(payload, headers): Promise<VerifyResult>",
+    "memoryAdapter(): MemoryAdapter",
+    "isValidSecret(secret): boolean",
+    "signPayload(secret, eventId, timestampSec, payload): Promise<string>",
+    "EventUnion<E>",
+    "OutboxAdapter<Tx>",
+    "OutboxRow",
+    "VerifyFailure",
+    "VerifyResult<T>",
+    "Subscriber",
+    "SubscriberResolver"
+  ]
+}

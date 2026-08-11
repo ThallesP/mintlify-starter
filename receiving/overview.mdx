@@ -1,0 +1,90 @@
+---
+title: "Receiving and Verifying Webhooks with @webhooks/verify"
+sidebarTitle: "Overview"
+description: "Zero-dependency, WebCrypto-based webhook verification for Node.js, Bun, Deno, Cloudflare Workers, and any edge runtime."
+---
+
+`@webhooks/verify` is the consumer-side half of the Standard Webhooks library. It gives you a single `createVerifier` function that validates incoming webhook signatures without pulling in any external dependencies — it relies entirely on the platform's built-in WebCrypto APIs. Whether you're running on a traditional Node.js server, a serverless edge function, or a Cloudflare Worker, the same code works unchanged.
+
+## Platform support
+
+`@webhooks/verify` requires a runtime that exposes the global `crypto.subtle` API. The following platforms are supported out of the box:
+
+| Runtime | Notes |
+|---|---|
+| **Node.js 20+** | `globalThis.crypto` is available without any import |
+| **Bun** | Fully supported |
+| **Deno** | Fully supported |
+| **Cloudflare Workers** | Fully supported |
+| **Edge runtimes** (Vercel, Netlify) | Fully supported |
+
+<Note>
+  Stock Node.js 18 does **not** expose `globalThis.crypto` by default. If you must run on Node 18, you can polyfill it with `globalThis.crypto = require("crypto").webcrypto` at startup, but upgrading to Node 20 is the simpler path.
+</Note>
+
+## Installation
+
+<CodeGroup>
+
+```bash npm
+npm install @webhooks/verify
+```
+
+```bash yarn
+yarn add @webhooks/verify
+```
+
+```bash pnpm
+pnpm add @webhooks/verify
+```
+
+```bash bun
+bun add @webhooks/verify
+```
+
+</CodeGroup>
+
+## Core concept
+
+The entire API surface of `@webhooks/verify` is two calls. First, you call `createVerifier(secret)` once at startup — typically at module load time or in your app's initialisation code — and it returns a `Verifier` instance. Then, for each incoming request, you call one of two methods on that verifier:
+
+- **`verifier.verify(request)`** — for frameworks that give you a standard Fetch `Request` object (Next.js App Router, Hono, Remix, Cloudflare Workers).
+- **`verifier.verifyPayload(payload, headers)`** — for Node.js frameworks like Express or Fastify where you manage body parsing yourself.
+
+Both methods return a `VerifyResult<T>` — a discriminated union that is either `{ ok: true; id; timestamp; payload }` or `{ ok: false; reason }`. Verification failures are plain values, never thrown exceptions, so you never need a try/catch around the verify call itself.
+
+```typescript
+import { createVerifier } from "@webhooks/verify";
+
+// Create once — constructor validates the secret and imports the HMAC key
+const verifier = createVerifier(process.env.WEBHOOK_SECRET!);
+
+// Call per request
+export async function POST(req: Request) {
+  const result = await verifier.verify(req);
+  if (!result.ok) return new Response(result.reason, { status: 400 });
+
+  result.payload; // parsed JSON body, typed as unknown by default
+  return new Response(null, { status: 204 });
+}
+```
+
+## Explore the receiving guides
+
+<CardGroup cols={2}>
+  <Card title="Verifying signatures" icon="shield-check" href="/receiving/verifying">
+    Full API reference for `createVerifier`, both verify methods, error codes, and code examples for Next.js, Hono, Express, and Fastify.
+  </Card>
+  <Card title="Typed webhook payloads" icon="code" href="/receiving/typed-events">
+    Use `EventUnion` from the sender's package to get fully-typed `payload` objects — with no runtime dependency on the sender.
+  </Card>
+  <Card title="Deduplication" icon="copy-slash" href="/receiving/deduplication">
+    Webhooks are delivered at-least-once. Learn how to use `webhook-id` as an idempotency key and achieve exactly-once processing.
+  </Card>
+</CardGroup>
+
+## svix compatibility
+
+<Note>
+  `@webhooks/verify` also accepts `svix-id`, `svix-timestamp`, and `svix-signature` headers as a fallback for the canonical `webhook-*` header names. If your sender uses the svix platform, you can verify those webhooks with the same library and the same code.
+</Note>
