@@ -1,7 +1,7 @@
 ---
-title: "@webhooks/sdk API Reference"
+title: "@webhooks/sdk Complete API Reference for Webhook Producers"
 sidebarTitle: "SDK API"
-description: "Complete API reference for @webhooks/sdk — factory functions, delivery config, types, and the outbox adapter interface."
+description: "Full API reference for the @webhooks/sdk package: webhooks(), direct(), outbox(), send(), signing helpers, outbox adapter, and all exported types."
 ---
 
 The `@webhooks/sdk` package is the producer-side library. It lets you define a typed event map, configure how webhooks are delivered (directly in-process or durably via an outbox table), and call `send()` with type-narrowed payloads. Every public export is documented below.
@@ -682,6 +682,30 @@ type SubscriberResolver = (event: {
 ```
 
 A function — typically a database query — that returns the list of subscribers for a given event. The `subject` argument makes multi-tenant scoping easy: filter by `subject` to return only the subscribers for the relevant account or user.
+
+---
+
+### `SubjectMode`
+
+Controls whether the `subject` field on `send()` is required or optional.
+
+```ts
+type SubjectMode = "optional" | undefined;
+```
+
+Pass `"optional"` via `subject: "optional"` in `WebhooksConfig` to relax the compile-time requirement on `subject`. When `undefined` (the default), omitting `subject` from `send()` is a TypeScript compile error. At runtime the `prepare()` function also enforces this and returns an error for any JS caller that bypasses the type system.
+
+---
+
+### `Delivery`
+
+The union type accepted by the `delivery` field of `WebhooksConfig`. You do not construct this type directly — use [`direct()`](#directopts) or [`outbox()`](#outboxadapter-opts) to create the appropriate variant.
+
+```ts
+type Delivery = DirectDelivery | OutboxDelivery<never>;
+```
+
+`OutboxDelivery<never>` is the erased internal form. The `webhooks()` overloads carry the real transaction type `Tx` in the `OutboxDelivery<Tx>` they accept and return.
 
 ---
 

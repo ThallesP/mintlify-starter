@@ -1,7 +1,7 @@
 ---
 title: "Receiving and Verifying Webhooks with @webhooks/verify"
 sidebarTitle: "Overview"
-description: "Zero-dependency, WebCrypto-based webhook verification for Node.js, Bun, Deno, Cloudflare Workers, and any edge runtime."
+description: "Install @webhooks/verify, create a verifier from your secret, and call verify() or verifyPayload() to authenticate incoming webhook requests."
 ---
 
 `@webhooks/verify` is the consumer-side half of the Standard Webhooks library. It gives you a single `createVerifier` function that validates incoming webhook signatures without pulling in any external dependencies — it relies entirely on the platform's built-in WebCrypto APIs. Whether you're running on a traditional Node.js server, a serverless edge function, or a Cloudflare Worker, the same code works unchanged.

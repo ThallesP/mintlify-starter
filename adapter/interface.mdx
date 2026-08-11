@@ -1,5 +1,5 @@
 ---
-title: "OutboxAdapter Interface: Bring Your Own Storage"
+title: "OutboxAdapter<Tx> Interface: Bring Your Own Storage"
 sidebarTitle: "Interface"
 description: "Implement the five-method OutboxAdapter interface to connect the webhook outbox to any database or storage backend you already use."
 ---
@@ -25,7 +25,7 @@ The `OutboxAdapter` interface is the contract between the Standard Webhooks SDK 
 </ParamField>
 
 <ParamField body="dead" type="(rowId: string, attempts: number, lastError: string) => Promise<void>" required>
-  Moves the row to the dead-letter state (`status: 'dead'`). The worker calls this either when `attempts` reaches `maxAttempts`, or immediately when a row has no signing secret. Dead rows are never re-claimed by the worker — you replay them manually after investigating the failure.
+  Moves the row to the dead-letter state (`status: 'dead'`). The worker calls this either when `attempts` reaches `maxAttempts`, or immediately when neither the row nor the webhooks instance provides a signing secret. Dead rows are never re-claimed by the worker — you replay them manually after investigating the failure.
 </ParamField>
 
 ## The `OutboxRow` shape
@@ -58,7 +58,7 @@ Key fields to understand:
 - **`eventType`** — the event name from your schema (e.g. `"invoice.paid"`). Useful for dead-letter filtering.
 - **`subject`** — the domain entity the event is about, in your vocabulary (`"acct_42"`, `"user_123"`). Nullable when the webhooks instance is configured with `subject: "optional"`. Index this column — it enables queries like "all failed deliveries for account 42".
 - **`body`** — the pre-serialized JSON payload. The worker signs and sends this string verbatim at delivery time; never re-serialize it.
-- **`secret`** — the per-subscriber signing secret, or `null` if the row should fall back to the adapter's `defaultSecret`. If both are `null`, the worker dead-letters the row immediately.
+- **`secret`** — the per-subscriber signing secret, or `null` if the row should fall back to the signing secret configured on the `webhooks()` instance (`signing.secret`). If neither is present, the worker dead-letters the row immediately.
 - **`status`** — one of `"pending"`, `"delivered"`, or `"dead"`. Your `claim` implementation should only return `"pending"` rows.
 - **`attempts`** — how many delivery attempts have been made so far. Starts at `0`; the worker increments it before calling `retry` or `dead`.
 - **`nextAttemptAt`** — when the row is eligible to be claimed again. Set to `now` on insert; updated to a future time on retry.

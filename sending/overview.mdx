@@ -1,7 +1,7 @@
 ---
-title: "Sending Webhooks with @webhooks/sdk"
+title: "Sending Webhooks with the @webhooks/sdk Producer SDK"
 sidebarTitle: "Overview"
-description: "Learn how @webhooks/sdk lets you define typed events, resolve subscribers, sign payloads, and deliver webhooks reliably."
+description: "Learn how @webhooks/sdk lets you define typed events, resolve subscribers, sign payloads, and choose between direct and outbox delivery."
 ---
 
 `@webhooks/sdk` is the producer side of the Standard Webhooks stack. You define a map of typed events, tell the SDK who should receive each one, configure a signing secret, and call `wh.send()`. The SDK takes care of signing every request with HMAC-SHA256, delivering it over HTTP, and reporting back what happened — per subscriber, not just in aggregate.
@@ -87,15 +87,20 @@ type Result<T> =
 
 **`result.ok === false`** means something prevented any delivery from being attempted. These are fatal, setup-level failures: schema validation rejected the payload, the event type is not in your `events` map, the payload is not JSON-serializable, the subscriber resolver threw, no signing secret was found for a subscriber, or the secret has an invalid `whsec_` prefix.
 
-**`result.ok === true`** means delivery was attempted for every subscriber. The top-level result does not tell you whether each subscriber succeeded — that information lives in `result.value.deliveries` (direct mode) or `result.value.enqueued` (outbox mode). A subscriber that exhausted all retries without a 2xx response will have `delivered: false` in its `DeliveryOutcome`, but `result.ok` is still `true`.
+**`result.ok === true`** means delivery was attempted (direct mode) or enqueued (outbox mode) for every subscriber. The top-level result does not tell you whether each subscriber succeeded — that information lives in `result.value.deliveries` (direct mode) or `result.value.enqueued` (outbox mode). In direct mode, a subscriber that exhausted all retries without a 2xx response will have `delivered: false` in its `DeliveryOutcome`, but `result.ok` is still `true`.
 
 ```typescript
+// Direct mode — inspect per-subscriber HTTP outcomes
 if (result.ok) {
-  // Top level succeeded — but check individual deliveries
   const failed = result.value.deliveries.filter((d) => !d.delivered);
   if (failed.length > 0) {
     console.warn("some subscribers did not receive the event:", failed);
   }
+}
+
+// Outbox mode — result.value.enqueued is a count of rows inserted
+if (result.ok) {
+  console.log(`enqueued ${result.value.enqueued} outbox row(s) for ${result.value.eventId}`);
 }
 ```
 

@@ -203,19 +203,19 @@ The SDK delegates all storage operations to an adapter you provide. Five methods
 ```typescript
 interface OutboxAdapter<Tx = unknown> {
   /** Insert new rows, optionally inside a caller-supplied transaction. */
-  insert(rows: OutboxRow[], tx?: Tx): Promise<void>;
+  insert: (rows: OutboxRow[], tx?: Tx) => Promise<void>;
 
   /** Claim rows that are pending and due now (next_attempt_at <= now). */
-  claim(limit: number, now: Date): Promise<OutboxRow[]>;
+  claim: (limit: number, now: Date) => Promise<OutboxRow[]>;
 
   /** Mark a row delivered. */
-  complete(rowId: string): Promise<void>;
+  complete: (rowId: string) => Promise<void>;
 
   /** Schedule a retry at nextAttemptAt after a failed attempt. */
-  retry(rowId: string, attempts: number, nextAttemptAt: Date, lastError: string): Promise<void>;
+  retry: (rowId: string, attempts: number, nextAttemptAt: Date, lastError: string) => Promise<void>;
 
   /** Move a row to dead-letter state after exhausting all attempts. */
-  dead(rowId: string, attempts: number, lastError: string): Promise<void>;
+  dead: (rowId: string, attempts: number, lastError: string) => Promise<void>;
 }
 ```
 

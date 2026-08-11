@@ -1,7 +1,7 @@
 ---
-title: "Error Codes and Result Types in Standard Webhooks"
+title: "Error Codes and Result Types in the Standard Webhooks SDK"
 sidebarTitle: "Error Codes"
-description: "A complete reference for SDK send() error strings, VerifyFailure codes, and the Result<T> pattern used throughout the library."
+description: "Reference for every SDK send() error string and VerifyFailure reason code, the Result<T> pattern, and which errors throw at construction time."
 ---
 
 Standard Webhooks takes a deliberate position on errors: failures that can happen at request time are returned as values, not thrown as exceptions. The `Result<T>` type — `{ ok: true; value: T } | { ok: false; error: string }` — is the return type of every `send()` call, and `VerifyResult<T>` plays the same role on the consumer side. You check `result.ok` with a plain `if` statement and handle the failure inline. The only time the library throws is during construction — an invalid secret or an illegal configuration value fails loudly at boot instead of silently misbehaving at request time.

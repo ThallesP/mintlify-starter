@@ -14,7 +14,7 @@ The SDK implements the [Standard Webhooks](https://www.standardwebhooks.com/) si
   <Step title="Build the signed string">
     Concatenates the event ID, a Unix timestamp in seconds, and the raw JSON body using `.` as a separator:
 
-    ```
+    ```text
     {webhook-id}.{webhook-timestamp}.{body}
     ```
   </Step>

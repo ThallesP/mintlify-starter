@@ -1,7 +1,7 @@
 ---
-title: "@webhooks/verify API Reference"
+title: "@webhooks/verify API Reference for Webhook Consumers"
 sidebarTitle: "Verify API"
-description: "Complete API reference for @webhooks/verify — createVerifier, the Verifier interface, VerifyResult, VerifyFailure codes, and HeadersLike."
+description: "Complete API reference for @webhooks/verify — createVerifier(), the Verifier interface, VerifyResult<T>, all VerifyFailure codes, and HeadersLike."
 ---
 
 The `@webhooks/verify` package is the consumer-side library. It has zero dependencies and uses the WebCrypto API, so it runs on Node 20+, Bun, Deno, Cloudflare Workers, and any edge runtime that exposes a global `crypto.subtle`. You create a `Verifier` once at startup and call it on every incoming webhook request.

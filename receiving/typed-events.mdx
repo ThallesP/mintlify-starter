@@ -1,5 +1,5 @@
 ---
-title: "Typed Webhook Payloads Using EventUnion"
+title: "Typed Webhook Payloads with EventUnion and @webhooks/sdk"
 sidebarTitle: "Typed Events"
 description: "Get fully-typed webhook payloads in TypeScript by importing EventUnion from the sender's package — zero runtime dependency required."
 ---
@@ -12,7 +12,7 @@ On the sender's side, the developer defines a map of event names to Zod (or any 
 
 ```typescript
 // Inside the sender's package (e.g. acme-sdk)
-import { webhooks } from "@webhooks/sdk";
+import { type EventUnion } from "@webhooks/sdk";
 import { z } from "zod";
 
 const events = {

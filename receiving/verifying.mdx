@@ -1,7 +1,7 @@
 ---
 title: "Verify Webhook Signatures in Node.js and Edge Runtimes"
 sidebarTitle: "Verifying"
-description: "Step-by-step guide to verifying Standard Webhooks HMAC-SHA256 signatures in any JavaScript runtime using @webhooks/verify."
+description: "API reference for createVerifier, verify(), and verifyPayload() — including all eight failure codes and examples for Next.js, Hono, Express, and Fastify."
 ---
 
 Verifying a webhook signature proves that the request was signed by whoever holds your shared secret and that it was sent recently — protecting you from forged payloads and replay attacks. `@webhooks/verify` implements the [Standard Webhooks](https://www.standardwebhooks.com/) HMAC-SHA256 scheme: a MAC over `{id}.{timestamp}.{body}`, with the result sent in the `webhook-signature` header.
@@ -179,7 +179,7 @@ When `ok` is `false`:
 
 | `reason` | Cause |
 |---|---|
-| `missing_headers` | One or more of `webhook-id`, `webhook-timestamp`, `webhook-signature` is absent. |
+| `missing_headers` | One or more of `webhook-id`, `webhook-timestamp`, `webhook-signature` (or their `svix-*` equivalents) is absent. |
 | `invalid_id` | The `webhook-id` contains a `.` character, which makes the signed string ambiguous. |
 | `invalid_timestamp` | The `webhook-timestamp` header is not a valid integer. |
 | `timestamp_out_of_tolerance` | The timestamp differs from wall-clock time by more than `toleranceSec`. |
@@ -191,3 +191,17 @@ When `ok` is `false`:
 ## Security note: signature candidates
 
 The `webhook-signature` header can contain multiple space-separated `v1,<base64>` candidates — this supports key rotation, where the sender signs with both the old and new secret simultaneously during a rollover window. To prevent denial-of-service attacks driven by an inflated header, `@webhooks/verify` tries **at most 8 candidates** per request and stops as soon as one matches.
+
+## svix-compatible header names
+
+`@webhooks/verify` accepts `svix-id`, `svix-timestamp`, and `svix-signature` as fallbacks for the canonical `webhook-id`, `webhook-timestamp`, and `webhook-signature` header names. `webhook-*` is preferred when both are present. This means you can verify webhooks from svix-based senders with the same library and the same code.
+
+## The `HeadersLike` type
+
+`verifyPayload` accepts a `HeadersLike` value for the headers argument:
+
+```typescript
+type HeadersLike = Headers | Record<string, string | string[] | undefined>;
+```
+
+The Fetch `Headers` object is accepted directly. Plain objects (which is what `req.headers` is in Express and Fastify) are also accepted — header name lookup is case-insensitive, so headers from frameworks that preserve original casing work correctly.
